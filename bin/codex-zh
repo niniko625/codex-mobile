@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# 一键启动中文 Codex（相当于 cyo --zh）
+# DeepSeek 直连模式，无需 mimo2codex 代理
+
+ZH_PROMPT="以后所有自然语言使用简体中文回答。
+分析、计划、修改说明、总结均使用中文。
+代码、命令、文件路径、日志保持原文。"
+
+CODEX_SANDBOX_NETWORK_DISABLED=0 \
+codex --dangerously-bypass-approvals-and-sandbox \
+"$ZH_PROMPT" "$@"

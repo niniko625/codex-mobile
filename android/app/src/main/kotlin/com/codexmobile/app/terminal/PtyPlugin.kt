@@ -1,0 +1,501 @@
+package com.codexmobile.app.terminal
+
+import android.content.Context
+import android.util.Log
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodCall
+import io.flutter.plugin.common.MethodChannel
+import io.flutter.plugin.common.EventChannel
+import java.io.File
+import java.io.FileOutputStream
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.*
+
+/**
+ * PTY 终端插件 — Flutter ↔ Native PTY 通信桥
+ *
+ * 职责：
+ *   1. 管理 PTY 会话生命周期
+ *   2. 通过 MethodChannel 接收 Flutter 命令
+ *   3. 通过 EventChannel 向 Flutter 推送输出
+ *
+ * 支持两种模式：
+ *   - 简单模式（Phase 1）：Flutter 传入 shellPath / args / environment，直接创建 PTY
+ *   - BusyBox 模式（保留）：从 assets 解压 BusyBox 作为 Shell（向后兼容）
+ *
+ * MethodChannel:  com.codexmobile.app/terminal/native
+ * EventChannel:   com.codexmobile.app/terminal/native/output
+ */
+class PtyPlugin(private val context: Context) {
+
+    companion object {
+        private const val TAG = "PtyPlugin"
+
+        const val CHANNEL = "com.codexmobile.app/terminal/native"
+        const val OUTPUT_CHANNEL = "com.codexmobile.app/terminal/native/output"
+
+        private const val BUSYBOX_ASSET = "busybox-arm64"
+        private const val BUSYBOX_NAME = "busybox"
+        private const val BIN_DIR = "bin"
+
+        private val sessions = ConcurrentHashMap<String, PtySession>()
+        private val outputSinks = ConcurrentHashMap<String, EventChannel.EventSink>()
+        private val readJobs = ConcurrentHashMap<String, Job>()
+
+        private var binDir: File? = null
+        private var busyboxReady = false
+        private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    }
+
+    fun registerWith(engine: FlutterEngine) {
+        MethodChannel(
+            engine.dartExecutor.binaryMessenger,
+            CHANNEL
+        ).setMethodCallHandler { call, result ->
+            onMethodCall(call, result)
+        }
+
+        EventChannel(
+            engine.dartExecutor.binaryMessenger,
+            OUTPUT_CHANNEL
+        ).setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(arguments: Any?, sink: EventChannel.EventSink) {
+                val sessionId = arguments as? String
+                if (sessionId != null) {
+                    outputSinks[sessionId] = sink
+                    Log.d(TAG, "Output sink registered for session: $sessionId")
+                }
+            }
+
+            override fun onCancel(arguments: Any?) {
+                val sessionId = arguments as? String
+                if (sessionId != null) {
+                    outputSinks.remove(sessionId)
+                    Log.d(TAG, "Output sink cancelled for session: $sessionId")
+                }
+            }
+        })
+
+        Log.d(TAG, "PtyPlugin registered: $CHANNEL / $OUTPUT_CHANNEL")
+    }
+
+    private fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
+        try {
+            when (call.method) {
+                "checkBusybox" -> handleCheckBusybox(result)
+                "getNativeLibDir" -> handleGetNativeLibDir(result)
+                "setupBusybox" -> handleSetupBusybox(result)
+                "createSession" -> handleCreateSession(call, result)
+                "write" -> handleWrite(call, result)
+                "resize" -> handleResize(call, result)
+                "closeSession" -> handleCloseSession(call, result)
+                "getShellPath" -> handleGetShellPath(result)
+                "isAlive" -> handleIsAlive(call, result)
+                else -> result.notImplemented()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Method $call.method failed", e)
+            result.error("PTY_ERROR", e.message, null)
+        }
+    }
+
+    // ── BusyBox 相关（保留向后兼容） ──
+
+    private fun handleCheckBusybox(result: MethodChannel.Result) {
+        val ready = busyboxReady && binDir != null && File(binDir, BUSYBOX_NAME).exists()
+        result.success(mapOf(
+            "ready" to ready,
+            "binDir" to (binDir?.absolutePath ?: ""),
+            "busyboxPath" to if (ready) File(binDir, BUSYBOX_NAME).absolutePath else ""
+        ))
+    }
+
+    // ── Native Library 目录（jniLibs 解压区，系统保证可执行）──
+
+    /**
+     * 返回 nativeLibraryDir（jniLibs 解压目录）。
+     *
+     * App 内置的 libbusybox.so（jniLibs/arm64-v8a）在安装时由
+     * Android 解压到 nativeLibraryDir，该分区由系统管理且保证可执行
+     * （与 Operit 同源方案），不受 filesDir noexec / SELinux 限制。
+     * Flutter 侧 NativeBusybox 优先复用该路径，避免复制到 filesDir
+     * 后 chmod 无效导致的 EACCES。
+     */
+    private fun handleGetNativeLibDir(result: MethodChannel.Result) {
+        try {
+            val nativeLibDir = context.applicationInfo.nativeLibraryDir
+            val busyboxSo = File(nativeLibDir, "libbusybox.so")
+            result.success(mapOf(
+                "nativeLibDir" to nativeLibDir,
+                "busyboxSoExists" to busyboxSo.exists(),
+                "busyboxSoPath" to busyboxSo.absolutePath,
+                "busyboxSoSize" to (if (busyboxSo.exists()) busyboxSo.length() else 0L)
+            ))
+        } catch (e: Exception) {
+            Log.e(TAG, "getNativeLibDir failed", e)
+            result.error("NATIVE_LIB_DIR_FAILED", e.message, null)
+        }
+    }
+
+    private fun handleSetupBusybox(result: MethodChannel.Result) {
+        try {
+            setupBusybox()
+            result.success(mapOf(
+                "success" to true,
+                "binDir" to (binDir?.absolutePath ?: ""),
+                "busyboxPath" to File(binDir, BUSYBOX_NAME).absolutePath
+            ))
+        } catch (e: Exception) {
+            Log.e(TAG, "BusyBox setup failed", e)
+            result.error("SETUP_FAILED", "BusyBox setup failed: ${e.message}", null)
+        }
+    }
+
+    private fun setupBusybox() {
+        if (busyboxReady) return
+
+        val filesDir = context.filesDir
+        binDir = File(filesDir, BIN_DIR).also { it.mkdirs() }
+
+        val busyboxFile = File(binDir, BUSYBOX_NAME)
+
+        // 复用前必须通过 execve 冒烟：canExecute() 只反映权限位，
+        // 无法发现 noexec / SELinux denial / 半写损坏文件。与 Dart
+        // NativeBusybox 共用 files/bin/busybox，只有「可用」才复用，
+        // 否则原子重建，避免把坏文件当作可用工具。
+        if (busyboxFile.exists() && busyboxFile.canExecute() && busyboxExecSmoke(busyboxFile)) {
+            Log.d(TAG, "BusyBox already exists and works at ${busyboxFile.absolutePath}")
+        } else {
+            if (busyboxFile.exists()) {
+                Log.w(TAG, "BusyBox exists but unusable, rebuilding: ${busyboxFile.absolutePath}")
+                busyboxFile.delete()
+            }
+            Log.d(TAG, "Extracting BusyBox from assets...")
+            try {
+                extractBusyboxAtomically(busyboxFile)
+            } catch (e: Exception) {
+                throw PtySession.PtyException(
+                    "Failed to extract BusyBox from assets: ${e.message}"
+                )
+            }
+            if (!busyboxExecSmoke(busyboxFile)) {
+                throw PtySession.PtyException(
+                    "BusyBox extracted but execve smoke failed: ${busyboxFile.absolutePath}"
+                )
+            }
+            Log.d(TAG, "BusyBox extracted: ${busyboxFile.length()} bytes")
+        }
+
+        installBusyboxApplets(busyboxFile)
+        busyboxReady = true
+        Log.d(TAG, "BusyBox setup complete at ${binDir!!.absolutePath}")
+    }
+
+    // execve 冒烟：`busybox true`，3 秒超时。stat 权限位正确不等于
+    // 内核允许执行（noexec mount / SELinux denial / 损坏 ELF / 半写
+    // 截断都会在这里暴露），与 Dart NativeBusybox.verifyUsable 对齐。
+    private fun busyboxExecSmoke(busyboxFile: File): Boolean {
+        return try {
+            val p = Runtime.getRuntime().exec(arrayOf(busyboxFile.absolutePath, "true"))
+            val ok = p.waitFor(3, java.util.concurrent.TimeUnit.SECONDS) && p.exitValue() == 0
+            if (!ok) {
+                Log.w(TAG, "BusyBox execve smoke failed: ${busyboxFile.absolutePath}")
+            }
+            ok
+        } catch (e: Exception) {
+            Log.w(TAG, "BusyBox execve smoke error: ${busyboxFile.absolutePath} -> ${e.message}")
+            false
+        }
+    }
+
+    // 原子写入：写 `busybox.tmp` → setExecutable → rename 覆盖目标。
+    // 与 Dart NativeBusybox 共用 files/bin/busybox，必须避免对同一文件
+    // 非原子覆盖写（FileOutputStream 直写目标会先截断再写，并发下留下
+    // 半写文件 → Process.start EACCES / Exec format error）。临时文件
+    // 与目标同目录，保证 rename 在同一文件系统内原子完成。
+    private fun extractBusyboxAtomically(busyboxFile: File) {
+        val dir = busyboxFile.parentFile
+            ?: throw PtySession.PtyException("busybox parent dir missing")
+        val tmp = File(dir, "busybox.tmp.${System.currentTimeMillis()}")
+        try {
+            context.assets.open(BUSYBOX_ASSET).use { input ->
+                FileOutputStream(tmp).use { output ->
+                    input.copyTo(output)
+                }
+            }
+            tmp.setExecutable(true, false)
+            tmp.setReadable(true, false)
+            if (!tmp.canExecute()) {
+                throw PtySession.PtyException("busybox tmp not executable")
+            }
+            if (!tmp.renameTo(busyboxFile)) {
+                // renameTo 失败（目标已存在等）→ 先删除目标再重试
+                busyboxFile.delete()
+                if (!tmp.renameTo(busyboxFile)) {
+                    throw PtySession.PtyException("busybox atomic rename failed")
+                }
+            }
+        } catch (e: Exception) {
+            tmp.delete()
+            throw e
+        }
+    }
+
+    private fun installBusyboxApplets(busyboxFile: File) {
+        val dir = binDir ?: return
+        var installOk = false
+        try {
+            val process = Runtime.getRuntime().exec(
+                arrayOf(busyboxFile.absolutePath, "--install", dir.absolutePath)
+            )
+            process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
+            if (File(dir, "ash").exists()) {
+                installOk = true
+                Log.d(TAG, "BusyBox --install completed (ash found)")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "BusyBox --install failed: ${e.message}")
+        }
+
+        if (!installOk) {
+            Log.w(TAG, "Falling back to manual ash creation")
+            val ashFile = File(dir, "ash")
+            try {
+                java.nio.file.Files.createSymbolicLink(
+                    ashFile.toPath(),
+                    busyboxFile.toPath()
+                )
+                Log.d(TAG, "Created ash symlink")
+            } catch (e1: Exception) {
+                try {
+                    java.nio.file.Files.createLink(
+                        ashFile.toPath(),
+                        busyboxFile.toPath()
+                    )
+                    Log.d(TAG, "Created ash hardlink")
+                } catch (e2: Exception) {
+                    try {
+                        busyboxFile.copyTo(ashFile, overwrite = true)
+                        ashFile.setExecutable(true, false)
+                        Log.d(TAG, "Copied busybox to ash")
+                    } catch (e3: Exception) {
+                        Log.w(TAG, "Failed to create ash: ${e3.message}")
+                    }
+                }
+            }
+        }
+    }
+
+    private fun getShellPath(): String {
+        if (binDir == null) {
+            throw PtySession.PtyException("BusyBox not set up")
+        }
+        val ashPath = File(binDir, "ash").absolutePath
+        if (File(ashPath).exists()) {
+            return ashPath
+        }
+        Log.w(TAG, "ash symlink not found, using busybox ash directly")
+        return File(binDir, BUSYBOX_NAME).absolutePath
+    }
+
+    private fun getBusyboxEnvironment(workDir: String): Array<String> {
+        val dir = binDir ?: return emptyArray()
+        return arrayOf(
+            "HOME=$workDir",
+            "PATH=${dir.absolutePath}:/system/bin:/system/xbin",
+            "TERM=xterm-256color",
+            "SHELL=${dir.absolutePath}/ash",
+            "USER=shell",
+            "LOGNAME=shell"
+        )
+    }
+
+    private fun mapToEnvArray(env: Map<String, String>?): Array<String> {
+        if (env == null || env.isEmpty()) return emptyArray()
+        return env.entries.map { (k, v) -> "$k=$v" }.toTypedArray()
+    }
+
+    // ── 会话管理 ──
+
+    private fun handleCreateSession(call: MethodCall, result: MethodChannel.Result) {
+        val sessionId = UUID.randomUUID().toString()
+        val rows = (call.argument<Int>("rows") ?: 60).coerceAtLeast(10)
+        val cols = (call.argument<Int>("cols") ?: 120).coerceAtLeast(20)
+        val workDir = call.argument<String>("workDir") ?: context.filesDir.absolutePath
+
+        val flutterShellPath = call.argument<String>("shellPath")
+        val flutterArgs = call.argument<List<String>>("args") ?: emptyList()
+        val flutterEnv = call.argument<Map<String, String>>("environment")
+
+        PtyNative.ensureLoaded()
+
+        val shellPath: String
+        val env: Array<String>
+
+        if (flutterShellPath != null && flutterShellPath.isNotEmpty()) {
+            // Phase 1: 使用 Flutter 传入的 Shell（如 /system/bin/sh）
+            shellPath = flutterShellPath
+            env = mapToEnvArray(flutterEnv)
+            Log.d(TAG, "Creating PTY session (Phase1): id=$sessionId, shell=$shellPath, args=$flutterArgs")
+        } else {
+            // 向后兼容: 使用 BusyBox
+            if (!busyboxReady) {
+                setupBusybox()
+            }
+            shellPath = getShellPath()
+            env = getBusyboxEnvironment(workDir)
+            Log.d(TAG, "Creating PTY session (BusyBox): id=$sessionId, shell=$shellPath")
+        }
+
+        val session = PtySession.create(
+            shellPath = shellPath,
+            args = flutterArgs.toTypedArray(),
+            env = env,
+            workDir = workDir,
+            rows = rows,
+            cols = cols
+        )
+
+        sessions[sessionId] = session
+
+        val readJob = scope.launch {
+            try {
+                val buf = ByteArray(4096)
+                // UTF-8 累积缓冲：保留末尾不完整的多字节序列，
+                // 与下一 chunk 拼接后再解码，避免中文等字符被切断成 U+FFFD（�）
+                var pending = ByteArray(0)
+                while (isActive && session.isAlive) {
+                    val nread = try {
+                        PtyNative.readFromPty(session.ptyFd, buf, 0, buf.size)
+                    } catch (e: Exception) {
+                        if (e.message?.contains("destroyed") == true) break
+                        -1
+                    }
+                    if (nread < 0) break
+                    if (nread == 0) {
+                        delay(10)
+                        continue
+                    }
+                    val combined = ByteArray(pending.size + nread)
+                    System.arraycopy(pending, 0, combined, 0, pending.size)
+                    System.arraycopy(buf, 0, combined, pending.size, nread)
+                    // 只解码完整前缀；未完成的尾随字节留到下一轮
+                    val completeLen = utf8CompleteLength(combined)
+                    val text = String(combined, 0, completeLen, Charsets.UTF_8)
+                    pending = combined.copyOfRange(completeLen, combined.size)
+
+                    if (text.isNotEmpty()) {
+                        withContext(Dispatchers.Main) {
+                            outputSinks[sessionId]?.success(mapOf(
+                                "sessionId" to sessionId,
+                                "data" to text,
+                                "isStderr" to false
+                            ))
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.d(TAG, "Read loop ended for session $sessionId: ${e.message}")
+            } finally {
+                withContext(Dispatchers.Main) {
+                    outputSinks[sessionId]?.success(mapOf(
+                        "sessionId" to sessionId,
+                        "data" to "",
+                        "isStderr" to false,
+                        "closed" to true
+                    ))
+                }
+            }
+        }
+        readJobs[sessionId] = readJob
+
+        result.success(mapOf(
+            "sessionId" to sessionId,
+            "pid" to session.pid,
+            "shellPath" to shellPath,
+            "binDir" to binDir?.absolutePath
+        ))
+    }
+
+    /**
+     * 计算 [data] 中「完整 UTF-8 前缀」的字节长度。
+     *
+     * PTY 按 4096 字节分块读取，一个多字节 UTF-8 字符（如中文）可能被切断在
+     * 块边界；逐块 `String(bytes, UTF_8)` 会把被切断的尾部解码成 U+FFFD（�）。
+     * 本函数从尾部定位最后一个可能未完成的序列，返回其起始字节之前的位置；
+     * 不完整的尾随字节由调用方保留，待下一 chunk 拼接后再解码。
+     */
+    private fun utf8CompleteLength(data: ByteArray): Int {
+        var i = data.size
+        // 从末尾回退，跳过连续 continuation 字节（10xxxxxx），定位序列起始字节
+        while (i > 0 && (data[i - 1].toInt() and 0xC0) == 0x80) i--
+        if (i == 0) return 0 // 全为 continuation 字节（异常流），保守视为不完整
+        val start = data[i - 1].toInt() and 0xFF
+        val need = when {
+            start and 0x80 == 0x00 -> 1 // ASCII
+            start and 0xE0 == 0xC0 -> 2 // 2 字节序列
+            start and 0xF0 == 0xE0 -> 3 // 3 字节序列
+            start and 0xF8 == 0xF0 -> 4 // 4 字节序列
+            else -> 1                    // 非法起始字节，按单字节处理
+        }
+        // 该序列所需字节数在缓冲内是否完整
+        return if (i - 1 + need <= data.size) data.size else i - 1
+    }
+
+    private fun handleWrite(call: MethodCall, result: MethodChannel.Result) {
+        val sessionId = call.argument<String>("sessionId") ?: ""
+        val text = call.argument<String>("data") ?: ""
+        val session = sessions[sessionId]
+            ?: throw PtySession.PtyException("Session not found: $sessionId")
+        session.writeString(text)
+        result.success(true)
+    }
+
+    private fun handleResize(call: MethodCall, result: MethodChannel.Result) {
+        val sessionId = call.argument<String>("sessionId") ?: ""
+        val rows = (call.argument<Int>("rows") ?: 60).coerceAtLeast(5)
+        val cols = (call.argument<Int>("cols") ?: 120).coerceAtLeast(10)
+        val session = sessions[sessionId]
+            ?: throw PtySession.PtyException("Session not found: $sessionId")
+        session.resize(rows, cols)
+        result.success(true)
+    }
+
+    private fun handleCloseSession(call: MethodCall, result: MethodChannel.Result) {
+        val sessionId = call.argument<String>("sessionId") ?: ""
+        readJobs[sessionId]?.cancel()
+        readJobs.remove(sessionId)
+        sessions[sessionId]?.close()
+        sessions.remove(sessionId)
+        outputSinks.remove(sessionId)
+        Log.d(TAG, "Session closed: $sessionId")
+        result.success(true)
+    }
+
+    private fun handleGetShellPath(result: MethodChannel.Result) {
+        try {
+            val path = if (busyboxReady) getShellPath() else ""
+            result.success(mapOf("shellPath" to path, "ready" to busyboxReady))
+        } catch (e: Exception) {
+            result.success(mapOf("shellPath" to "", "ready" to false))
+        }
+    }
+
+    private fun handleIsAlive(call: MethodCall, result: MethodChannel.Result) {
+        val sessionId = call.argument<String>("sessionId") ?: ""
+        val session = sessions[sessionId]
+        result.success(session?.isAlive == true)
+    }
+
+    fun disposeAll() {
+        Log.d(TAG, "Disposing all PTY sessions (${sessions.size})")
+        for ((id, session) in sessions.entries) {
+            readJobs[id]?.cancel()
+            session.close()
+        }
+        sessions.clear()
+        readJobs.clear()
+        outputSinks.clear()
+    }
+}
