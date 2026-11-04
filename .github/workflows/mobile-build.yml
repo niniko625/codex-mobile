@@ -1,0 +1,144 @@
+name: Mobile Build
+
+on:
+  push:
+    branches: [mobile-build]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mobile-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build installable APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.x
+          cache: true
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: '17'
+          cache: gradle
+
+      - name: Setup CMake
+        run: |
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ -f "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" "cmake;3.18.1" > /dev/null 2>&1 || true
+          else
+            sudo apt-get update -qq && sudo apt-get install -y -qq cmake
+          fi
+          cmake --version
+
+      - name: Prepare signing
+        run: |
+          mkdir -p "$HOME/.android"
+          cp android/debug.keystore "$HOME/.android/debug.keystore"
+
+      - name: Analyze, test and build
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          LOG_DIR="$RUNNER_TEMP/ci-results"
+          mkdir -p "$LOG_DIR"
+          OVERALL=0
+
+          run_step() {
+            local name="$1"
+            shift
+            echo "==> $name"
+            "$@" 2>&1 | tee "$LOG_DIR/$name.log"
+            local rc=${PIPESTATUS[0]}
+            echo "$rc" > "$LOG_DIR/$name.status"
+            if [ "$rc" -ne 0 ]; then
+              OVERALL=1
+            fi
+            return 0
+          }
+
+          run_step pub-get flutter pub get
+          run_step analyze flutter analyze --fatal-warnings --no-fatal-infos
+          run_step test flutter test --reporter expanded
+          run_step build flutter build apk --release --build-number="${{ github.run_number }}" --build-name=1.0.0
+
+          echo "$OVERALL" > "$LOG_DIR/overall.status"
+          if [ -f build/app/outputs/flutter-apk/app-release.apk ]; then
+            APK=build/app/outputs/flutter-apk/app-release.apk
+            sha256sum "$APK" | awk '{print $1}' > "$LOG_DIR/app-release.apk.sha256"
+            split -b 8388608 -d -a 3 "$APK" "$LOG_DIR/app-release.apk.part."
+          fi
+          exit 0
+
+      - name: Upload result bundle
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: mobile-build-${{ github.run_number }}
+          path: ${{ runner.temp }}/ci-results
+          if-no-files-found: ignore
+
+      - name: Publish installable APK
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=build/app/outputs/flutter-apk/app-release.apk
+          if [ ! -f "$APK" ]; then
+            echo '本次没有生成 APK，跳过 Release 发布'
+            exit 0
+          fi
+          if ! gh release view mobile-latest >/dev/null 2>&1; then
+            gh release create mobile-latest \
+              --prerelease \
+              --title '手机端最新构建' \
+              --notes '由 GitHub Actions 自动构建，每次推送 mobile-build 覆盖更新。'
+          fi
+          gh release upload mobile-latest "$APK" --clobber
+
+      - name: Publish result branch
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_BRANCH: ci-mobile-latest
+        shell: bash
+        run: |
+          set -euo pipefail
+          RESULT_DIR="$RUNNER_TEMP/ci-results"
+          mkdir -p "$RESULT_DIR"
+          printf 'run_number=%s\ncommit=%s\nbranch=%s\n' \
+            "${{ github.run_number }}" "${{ github.sha }}" "${{ github.ref_name }}" > "$RESULT_DIR/run.txt"
+
+          cd "$RESULT_DIR"
+          git init -b "$ARTIFACT_BRANCH"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if git diff --cached --quiet; then
+            echo 'No result changes to publish'
+            exit 0
+          fi
+          git commit -m "ci: mobile build ${{ github.run_number }}"
+          git push --force \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "HEAD:refs/heads/${ARTIFACT_BRANCH}"

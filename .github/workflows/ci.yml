@@ -1,0 +1,300 @@
+# ============================================================
+#  Codex Mobile Pro — CI Pipeline
+#  每次 push / pull_request 自动运行：
+#   1. Flutter Analyze (静态分析 + 风格检查)
+#   2. Flutter Test (单元测试 + Widget 测试)
+#   3. Android Debug Build
+# ============================================================
+
+name: CI
+
+on:
+  push:
+    branches: [main, develop, 'sprint-*']
+  pull_request:
+    branches: [main]
+  # 手动触发（push 事件丢失 / 需要重跑时）
+  workflow_dispatch:
+
+# 同分支连续 push 自动取消旧 run，避免排队等待（压缩端到端时间）
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ============================================================
+  #  Job 1: 静态分析
+  # ============================================================
+  analyze:
+    name: 🔍 Analyze
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.x
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Flutter analyze
+        run: flutter analyze --fatal-warnings --no-fatal-infos
+
+  # ============================================================
+  #  Job 2: 测试
+  # ============================================================
+  test:
+    name: 🧪 Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.x
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Run tests
+        run: flutter test --reporter expanded
+
+  # ============================================================
+  #  Job 3: Android Build (Debug + Release)
+  # ============================================================
+  build-android:
+    name: 📦 Android Build (debug + release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Restore fixed debug keystore (stable signing across builds)
+        run: |
+          mkdir -p "$HOME/.android"
+          cp android/debug.keystore "$HOME/.android/debug.keystore"
+          # 固定签名指纹（SHA256）用于核对每次构建使用同一密钥
+          sha256sum "$HOME/.android/debug.keystore"
+      - name: Decode release keystore from secrets (stable release signing)
+        env:
+          KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          KEYSTORE_PASS: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "⚠️  RELEASE_KEYSTORE_BASE64 secret 未配置，release 将 fallback 到 debug 签名"
+            exit 0
+          fi
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/codex-release.keystore"
+          if [ ! -s "$RUNNER_TEMP/codex-release.keystore" ]; then
+            echo "❌ keystore 解码结果为空"
+            exit 1
+          fi
+          echo "✅ release keystore 解码成功 ($(wc -c < "$RUNNER_TEMP/codex-release.keystore") bytes)"
+          echo "RELEASE_KEYSTORE_PATH=$RUNNER_TEMP/codex-release.keystore" >> "$GITHUB_ENV"
+          echo "RELEASE_KEYSTORE_PASSWORD=$KEYSTORE_PASS" >> "$GITHUB_ENV"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.x
+          cache: true
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+          cache: gradle
+
+      - name: Install CMake (for native pty library)
+        run: |
+          # GitHub Actions Ubuntu runner 预装 Android SDK，
+          # 但 CMake 3.18.1 需要手动安装
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ -f "$SDKMANAGER" ]; then
+            echo "Installing CMake 3.18.1 via sdkmanager..."
+            yes | "$SDKMANAGER" "cmake;3.18.1" > /dev/null 2>&1 || true
+            echo "CMake installed at: $SDK_ROOT/cmake/3.18.1"
+          else
+            echo "sdkmanager not found at $SDKMANAGER, trying apt..."
+            sudo apt-get update -qq && sudo apt-get install -y -qq cmake
+          fi
+          cmake --version
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Build Android APK (debug)
+        # versionCode = GitHub Actions run number（每次运行严格递增），
+        # 配合固定 keystore 实现无缝覆盖升级（无需卸载重装）。
+        run: flutter build apk --debug --build-number=${{ github.run_number }} --build-name=1.0.0
+      - name: Build Android APK (release)
+        # release 使用独立 upload keystore（codex-release，私钥来自 Actions secret），
+        # 不再复用仓库内公开的 debug.keystore。versionCode 与 debug 一致。
+        run: flutter build apk --release --build-number=${{ github.run_number }} --build-name=1.0.0
+
+      - name: Verify APK signature (must match fixed keystore)
+        run: |
+          EXPECTED="b1307e1488fe7cad36f0cac5ab2d1f0ce581e0c06afc74d391584a6bf2b93dd3"
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          APKSIGNER=$(ls "$SDK_ROOT"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)
+          if [ -z "$APKSIGNER" ]; then
+            echo "⚠️  apksigner 未找到，跳过签名校验"
+            exit 0
+          fi
+          ACTUAL=$("$APKSIGNER" verify --print-certs build/app/outputs/flutter-apk/app-debug.apk \
+            | grep "certificate SHA-256 digest" | awk '{print $NF}')
+          echo "expected: $EXPECTED"
+          echo "actual:   $ACTUAL"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "❌ APK 签名证书与固定 keystore 不匹配！覆盖安装会失败。"
+            exit 1
+          fi
+          echo "✅ APK 签名证书匹配固定 keystore"
+      - name: Verify APK signature (release, must match release keystore)
+        env:
+          EXPECTED: ${{ secrets.RELEASE_KEYSTORE_SHA256 }}
+        run: |
+          if [ -z "$EXPECTED" ]; then
+            echo "⚠️  RELEASE_KEYSTORE_SHA256 secret 未配置，跳过 release 签名校验"
+            exit 0
+          fi
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          APKSIGNER=$(ls "$SDK_ROOT"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)
+          if [ -z "$APKSIGNER" ]; then
+            echo "⚠️  apksigner 未找到，跳过签名校验"
+            exit 0
+          fi
+          ACTUAL=$("$APKSIGNER" verify --print-certs build/app/outputs/flutter-apk/app-release.apk \
+            | grep "certificate SHA-256 digest" | awk '{print $NF}' | tr -d ':' | tr 'A-Z' 'a-z')
+          echo "expected: $EXPECTED"
+          echo "actual:   $ACTUAL"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "❌ release APK 签名证书与 release keystore 不匹配！覆盖安装会失败。"
+            exit 1
+          fi
+          echo "✅ release APK 签名证书匹配独立 release keystore"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v5
+        with:
+          name: app-debug-apk-${{ github.run_number }}
+          path: build/app/outputs/flutter-apk/app-debug.apk
+      - name: Upload release APK
+        uses: actions/upload-artifact@v5
+        with:
+          name: app-release-apk-${{ github.run_number }}
+          path: build/app/outputs/flutter-apk/app-release.apk
+
+  # ============================================================
+  #  Job: Qwen-MM-Plugins 验证
+  #   1. 校验 8 个 qwen-mm skills（SKILL.md）已全量并入
+  #   2. 用 uvx --check-system 真实拉取并预构建 7 个 MCP server
+  #      （上游 install 脚本同款语义，--check-system 自检后即退出，不驻留）
+  # ============================================================
+  qwen-mm-verify:
+    name: 🧠 Qwen-MM Verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v8.3.2  # setup-uv 自 v8 起只发完整版本 tag（无 floating v8），@v8 无法解析
+        with:
+          enable-cache: true
+
+      - name: 校验 8 个 qwen-mm skills 已并入
+        run: |
+          set -eu
+          dirs=(api blender core edu-agent freecad search video-edit video-memory)
+          for name in "${dirs[@]}"; do
+            d="skills/qwen-mm-plugins-$name"
+            if [ ! -f "$d/SKILL.md" ]; then
+              echo "❌ 缺少 $d/SKILL.md"
+              exit 1
+            fi
+          done
+          n=$(find skills -maxdepth 1 -type d -name 'qwen-mm-plugins-*' | wc -l)
+          echo "✅ 8 个 qwen-mm-plugins skills 全部就位（目录数=$n）"
+          echo "- $n 个 qwen-mm skills 已并入" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: uvx --check-system 验证 7 个 MCP server
+        shell: bash
+        run: |
+          set -u
+          REPO=https://github.com/QwenLM/Qwen-MM-Plugins.git
+          # cap:tag — tag 实证自上游 .mcp.json（search 已修 v1.0.2，其余 v1.0.1）
+          caps=(
+            "core:qwen-mm-plugins-core-v1.0.1"
+            "api:qwen-mm-plugins-api-v1.0.1"
+            "search:qwen-mm-plugins-search-v1.0.2"
+            "video-memory:qwen-mm-plugins-video-memory-v1.0.1"
+            "video-edit:qwen-mm-plugins-video-edit-v1.0.1"
+            "blender:qwen-mm-plugins-blender-v1.0.1"
+            "freecad:qwen-mm-plugins-freecad-v1.0.1"
+          )
+          # blender/freecad 依赖桌面系统程序（Blender/FreeCAD/GL），CI 无头环境按上游语义容忍
+          tolerant=" blender freecad "
+          failed=0
+          for entry in "${caps[@]}"; do
+            cap="${entry%%:*}"; tag="${entry#*:}"
+            echo "--- [$cap] $tag ---"
+            if uvx --from "qwen-mm-plugins[$cap] @ git+$REPO@$tag" "qwen-mm-plugins-$cap" --check-system; then
+              echo "✅ $cap --check-system 通过"
+            else
+              code=$?
+              if [[ "$tolerant" == *" $cap "* ]]; then
+                echo "⚠️  $cap 报告系统依赖缺失（CI 无头环境，容忍，exit=$code）"
+              else
+                echo "❌ $cap --check-system 失败 (exit=$code)"
+                failed=1
+              fi
+            fi
+          done
+          if [ "$failed" -ne 0 ]; then
+            echo "❌ 存在失败的 MCP 能力"
+            exit 1
+          fi
+          echo "✅ 7 个 MCP server --check-system 全部完成"
+          echo "- 7 个 MCP server 经 uvx --check-system 验证" >> "$GITHUB_STEP_SUMMARY"
+
+  # ============================================================
+  #  Job 4: 构建报告
+  # ============================================================
+  report:
+    name: 📋 Report
+    needs: [analyze, test, build-android, qwen-mm-verify]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Check build status
+        run: |
+          echo "## 📋 CI Build Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔍 Analyze | ${{ needs.analyze.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🧪 Tests | ${{ needs.test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📦 Android Build (debug+release) | ${{ needs.build-android.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🧠 Qwen-MM Verify | ${{ needs.qwen-mm-verify.result }} |" >> $GITHUB_STEP_SUMMARY

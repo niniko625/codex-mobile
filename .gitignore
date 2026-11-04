@@ -1,0 +1,61 @@
+# Flutter
+.dart_tool/
+.packages
+build/
+*.js
+*.js.map
+!assets/threadripper.js
+
+# dsh-plugin: cmp-skill-index 的 JS 源文件需纳入版本控制（豁免上面的 *.js）
+!dsh-plugin/cmp-skill-index/index.js
+!dsh-plugin/cmp-skill-index/data/skills.js
+!dsh-plugin/cmp-skill-index/scripts/smoke.js
+
+# Android
+android/.gradle/
+android/app/build/
+android/local.properties
+*.iml
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dart
+*.g.dart
+*.freezed.dart
+.generator/
+
+# Logs
+*.log
+
+# Env
+.env
+.env.local
+*.jsonl
+test_report*.json
+.gh_test_report/
+
+# backup files
+*.bak2
+*.empty
+.ci_trigger
+
+# Local CI scratch (never commit)
+.tmp-ci/
+
+# Flutter auto-generated (migrator / plugin tooling)
+.flutter-plugins-dependencies
+android/gradlew.bat
+android/app/src/main/java/io/flutter/plugins/
+*.wsd
+
+# Kotlin 构建产物
+android/.kotlin/

@@ -1,0 +1,107 @@
+/// ====================================================================
+/// Ubuntu Runtime 清单测试
+///
+/// 守护 Phase「rootfs 流式解压」的关键清单数据：
+///   - expandedBytes：解压进度计算基准（错误会导致进度失真）
+///   - stripComponents：rootfs 目录层级（错误会导致解压路径错乱）
+///   - sha256 / size：下载完整性校验
+///
+/// 纯常量断言，不依赖平台 / 插件 / 真实文件系统。
+/// ====================================================================
+library;
+
+import 'package:codex_mobile_pro/runtime/runtime_dependency.dart';
+import 'package:codex_mobile_pro/runtime/runtime_manifest.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+void main() {
+  group('RuntimeArtifact.expandedBytes', () {
+    test('默认值为 0（非 rootfs artifact 不需要）', () {
+      const artifact = RuntimeArtifact(
+        name: 'x',
+        type: ArtifactType.deb,
+        url: 'https://example.com/x.deb',
+        sha256: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        size: 100,
+      );
+      expect(artifact.expandedBytes, 0);
+    });
+  });
+
+  group('Ubuntu Runtime manifest', () {
+    test('manifest 存在且包含 rootfs + proot 两个 artifact', () {
+      final manifest = RuntimeManifest.forTool(RuntimeTool.ubuntu);
+      expect(manifest, isNotNull);
+      expect(manifest!.artifacts.length, 2);
+      expect(manifest.artifacts[0].type, ArtifactType.rootfs);
+      expect(manifest.artifacts[1].type, ArtifactType.proot);
+    });
+
+    test('rootfs artifact 具备流式解压所需字段', () {
+      final manifest = RuntimeManifest.forTool(RuntimeTool.ubuntu)!;
+      final rootfs = manifest.artifacts[0];
+
+      expect(rootfs.expandedBytes, greaterThan(0),
+          reason: 'expandedBytes 用于真实解压进度，必须 > 0');
+      // 与实测 tar 流大小一致（64MB xz → 314,982,400 字节）
+      expect(rootfs.expandedBytes, 314982400);
+      // rootfs tar 顶层为发行版目录，strip 1 层
+      expect(rootfs.stripComponents, 1);
+      expect(rootfs.size, 64133552);
+      expect(rootfs.sha256.length, 64);
+    });
+
+    test('proot artifact 使用 Termux .deb 结构（strip 6 层）', () {
+      final manifest = RuntimeManifest.forTool(RuntimeTool.ubuntu)!;
+      final proot = manifest.artifacts[1];
+      expect(proot.stripComponents, 6);
+      expect(proot.size, 103028);
+      expect(
+        proot.sha256,
+        '10a394b585c2fc2b2c8502544f4e5f1be581dc8bfff79e8ba62f16207423e030',
+      );
+      expect(proot.includeFiles, isNotNull);
+      expect(proot.includeFiles, contains('usr/bin/proot'));
+      expect(proot.includeFiles, contains('usr/libexec/proot/loader'));
+    });
+
+    test('下载源包含多个可用镜像，避免单一代理失效导致部署中断', () {
+      final manifest = RuntimeManifest.forTool(RuntimeTool.ubuntu)!;
+      final rootfsUrls =
+          manifest.artifacts[0].buildUrlFallbackChain(region: 'cn');
+      final prootUrls =
+          manifest.artifacts[1].buildUrlFallbackChain(region: 'cn');
+
+      expect(rootfsUrls.length, greaterThanOrEqualTo(4));
+      expect(prootUrls.length, greaterThanOrEqualTo(4));
+      expect(rootfsUrls.any((url) => url.contains('ghfast.top')), isTrue);
+      expect(rootfsUrls.any((url) => url.contains('gh-proxy.com')), isTrue);
+      expect(
+        prootUrls.any((url) => url.contains('mirrors.tuna.tsinghua.edu.cn')),
+        isTrue,
+      );
+      expect(
+        prootUrls.any((url) => url.contains('mirrors.ustc.edu.cn')),
+        isTrue,
+      );
+      expect(
+        prootUrls.every((url) => !url.contains('proot_5.1.107.89')),
+        isTrue,
+        reason: '旧版本已从镜像删除，继续使用会稳定返回 404',
+      );
+    });
+
+    test('proot artifact 具备精确 fileTargets 映射（ENOTDIR 根因修复）', () {
+      final manifest = RuntimeManifest.forTool(RuntimeTool.ubuntu)!;
+      final proot = manifest.artifacts[1];
+      // .deb data.tar 内路径带 data/data/com.termux/files/usr/ 前缀，
+      // 统一 strip 会把 bin/proot 写成文件、loader 再当目录创建 → ENOTDIR。
+      // 必须按文件精确映射到 bin/ 与 libexec/ 两个布局。
+      expect(proot.fileTargets, {
+        'usr/bin/proot': 'bin/proot',
+        'usr/libexec/proot/loader': 'libexec/proot/loader',
+        'usr/libexec/proot/loader32': 'libexec/proot/loader32',
+      });
+    });
+  });
+}

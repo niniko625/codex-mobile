@@ -1,0 +1,28 @@
+# ============================================================
+#  Codex 配置文件 — Codex Mobile Pro
+#  DeepSeek 直连配置（不经过 mimo2codex 代理）
+#  $HOME 会被 deploy.sh 自动替换为实际路径
+# ============================================================
+
+# DeepSeek-V4.1-Flash 支持 1M 上下文；这里限制 128K 控制长会话费用
+model = "deepseek-flash"
+model_provider = "deepseek"
+model_context_window = 128000
+# 日常任务用 low 省钱；复杂调试可改为 high
+model_reasoning_effort = "low"
+
+[model_providers.deepseek]
+name = "DeepSeek"
+base_url = "https://api.deepseek.com"
+wire_api = "responses"
+requires_openai_auth = false
+env_key = "DEEPSEEK_API_KEY"
+
+[projects."__HOME_DIR__"]
+trust_level = "trusted"
+
+[tui.model_availability_nux]
+"gpt-5.5" = 4
+
+[features]
+apps = false
