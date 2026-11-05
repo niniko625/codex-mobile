@@ -117,10 +117,16 @@ name = "DeepSeek"
 base_url = "https://api.deepseek.com"
 env_key = "DEEPSEEK_API_KEY"
 wire_api = "responses"
+
+[features]
+plugins = false
 ''';
 
   /// config.toml 已配置的幂等标记
   static const String codexConfigMarker = '[model_providers.deepseek]';
+
+  /// Codex 插件系统关闭标记（Android 上插件同步线程可能 OOM/线程耗尽）。
+  static const String pluginsDisabledMarker = 'plugins = false';
 
   /// 模型元数据目录在 rootfs 内的绝对路径（与 [codexConfigToml] 中
   /// model_catalog_json 保持一致；codex 在 HOME=/root 下读取）。
@@ -455,7 +461,10 @@ wire_api = "responses"
   /// DEEPSEEK_API_KEY（由 bashrc-additions.sh 从 ~/.mimo2codex/.env
   /// export），直连 DeepSeek、跳过登录。
   ///
-  /// 幂等：已含 [codexConfigMarker] → 跳过。失败不阻断安装。
+  /// 幂等：provider 与 `features.plugins=false` 均已配置 → 跳过。
+  /// 两个配置独立自愈：旧版本 config 已有 DeepSeek provider 时，仍会补写
+  /// 插件关闭项，避免 codex 0.147 在 Android 上启动插件同步线程后 panic。
+  /// 失败不阻断安装。
   Future<void> _writeCodexConfig(
       ToolchainContext ctx, List<String> warnings) async {
     try {
@@ -465,16 +474,28 @@ wire_api = "responses"
       if (config.existsSync()) {
         final existing = config.readAsStringSync();
         if (existing.contains(codexConfigMarker)) {
-          if (existing.contains(modelCatalogMarker)) {
-            report(ctx, InstallPhase.completed, 1.0,
-                'Codex 已配置 DeepSeek 直连 + 模型目录');
-          } else {
+          var updated = existing;
+          final actions = <String>[];
+          if (!existing.contains(modelCatalogMarker)) {
             // 旧版本部署的 config：已 DeepSeek 直连但缺 model_catalog_json。
             // TOML 顶层字段必须在任何 table 之前 → 插到文件最前，不覆盖
             // 用户已有内容，消除 codex 启动的 fallback metadata 警告。
-            await config.writeAsString('$modelCatalogLine\n$existing');
+            updated = '$modelCatalogLine\n$updated';
+            actions.add('补写 model_catalog_json');
+          }
+          final withPluginsDisabled = _withPluginsDisabled(updated);
+          if (withPluginsDisabled != updated) {
+            updated = withPluginsDisabled;
+            actions.add('补写 features.plugins=false');
+          }
+
+          if (actions.isEmpty) {
             report(ctx, InstallPhase.completed, 1.0,
-                'Codex 已补写 model_catalog_json（旧 config 升级）');
+                'Codex 已配置 DeepSeek 直连 + 模型目录 + 插件关闭');
+          } else {
+            await config.writeAsString(updated);
+            report(ctx, InstallPhase.completed, 1.0,
+                'Codex 配置已升级：${actions.join('、')}');
           }
           return;
         }
@@ -486,6 +507,45 @@ wire_api = "responses"
     } catch (e) {
       _recordWarning(warnings, 'Codex config 写入失败', e);
     }
+  }
+
+  /// 幂等关闭 Codex 插件系统，兼容已有 `[features]` 表与用户其他配置。
+  static String _withPluginsDisabled(String content) {
+    final headerRe = RegExp(
+      r'^[ \t]*\[features\][ \t]*(?:#.*)?$',
+      multiLine: true,
+    );
+    final header = headerRe.firstMatch(content);
+    if (header == null) {
+      final tail = content.trimRight();
+      return '${tail.isEmpty ? '' : '$tail\n\n'}[features]\nplugins = false\n';
+    }
+
+    final afterHeader = content.substring(header.end);
+    final nextHeader = RegExp(
+      r'^[ \t]*\[[^\]]+\][ \t]*(?:#.*)?$',
+      multiLine: true,
+    ).firstMatch(afterHeader);
+    final sectionEnd = nextHeader == null
+        ? content.length
+        : header.end + nextHeader.start;
+    final section = content.substring(header.end, sectionEnd);
+    final pluginKey = RegExp(
+      r'^([ \t]*plugins[ \t]*=[ \t]*)([^\n#]*)(.*)$',
+      multiLine: true,
+    ).firstMatch(section);
+    if (pluginKey != null) {
+      if (pluginKey.group(2)!.trim() == 'false') return content;
+      final start = header.end + pluginKey.start;
+      final end = header.end + pluginKey.end;
+      return content.replaceRange(
+        start,
+        end,
+        '${pluginKey.group(1)}false${pluginKey.group(3)}',
+      );
+    }
+
+    return content.replaceRange(header.end, header.end, '\nplugins = false');
   }
 }
 

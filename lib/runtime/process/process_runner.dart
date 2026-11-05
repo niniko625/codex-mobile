@@ -265,7 +265,11 @@ class LocalProcessExecution implements IExecutionAdapter {
       });
       final stderrSub = process.stderr
           .transform(const SystemEncoding().decoder)
-          .listen((data) => stderrBuf.write(data));
+          .listen((data) {
+        stderrBuf.write(data);
+        // 流式回调：超时/崩溃时保留最近 stderr 供上层诊断
+        request.onStderrChunk?.call(data);
+      });
       final stdoutDone = stdoutSub.asFuture<void>();
       final stderrDone = stderrSub.asFuture<void>();
 

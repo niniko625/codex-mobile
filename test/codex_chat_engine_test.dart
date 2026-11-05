@@ -26,6 +26,7 @@ class FakeCodexRunner extends CodexRunner {
   String? lastSystemPrompt;
   List<String> lastImages = const [];
   String? lastThreadId;
+  Duration? lastTimeout;
 
   FakeCodexRunner({
     List<CodexEvent>? events,
@@ -45,6 +46,7 @@ class FakeCodexRunner extends CodexRunner {
     bool resolveWorkspace = true,
     List<String> images = const [],
     String? threadId,
+    void Function(String chunk)? onStderrChunk,
   }) async {
     runCount++;
     lastPrompt = prompt;
@@ -54,6 +56,7 @@ class FakeCodexRunner extends CodexRunner {
     lastSystemPrompt = systemPrompt;
     lastImages = images;
     lastThreadId = threadId;
+    lastTimeout = timeout;
     for (final e in eventsToEmit) {
       listener.onCodexEvent(e);
     }
@@ -92,6 +95,7 @@ class GateCodexRunner extends FakeCodexRunner {
     bool resolveWorkspace = true,
     List<String> images = const [],
     String? threadId,
+    void Function(String chunk)? onStderrChunk,
   }) async {
     runCount++;
     lastPrompt = prompt;
@@ -101,6 +105,7 @@ class GateCodexRunner extends FakeCodexRunner {
     lastSystemPrompt = systemPrompt;
     lastImages = images;
     lastThreadId = threadId;
+    lastTimeout = timeout;
     started.complete();
     await release.future;
     if (stopped) {
@@ -110,6 +115,95 @@ class GateCodexRunner extends FakeCodexRunner {
       listener.onCodexEvent(e);
     }
     return result;
+  }
+}
+
+/// 模拟 Codex 在 turn.started 后永久卡住，且 runner 自身也不返回。
+class HangingCodexRunner extends FakeCodexRunner {
+  final Completer<void> started = Completer<void>();
+  final String? stderrChunk;
+
+  HangingCodexRunner({this.stderrChunk});
+
+  @override
+  Future<CodexRunResult> run({
+    required String prompt,
+    required String hostWorkingDir,
+    String? systemPrompt,
+    Duration? timeout,
+    required CodexEventListener listener,
+    String? guestWorkingDir,
+    bool resolveWorkspace = true,
+    List<String> images = const [],
+    String? threadId,
+    void Function(String chunk)? onStderrChunk,
+  }) {
+    runCount++;
+    lastPrompt = prompt;
+    lastWorkingDir = hostWorkingDir;
+    lastGuestWorkingDir = guestWorkingDir;
+    lastResolveWorkspace = resolveWorkspace;
+    lastSystemPrompt = systemPrompt;
+    lastImages = images;
+    lastThreadId = threadId;
+    lastTimeout = timeout;
+    listener.onCodexEvent(const CodexThreadStarted(threadId: 'hung-thread'));
+    listener.onCodexEvent(const CodexTurnStarted());
+    if (stderrChunk != null) onStderrChunk?.call(stderrChunk!);
+    started.complete();
+    return Completer<CodexRunResult>().future;
+  }
+
+  @override
+  void stop() {
+    stopCount++;
+  }
+}
+
+/// 命令执行期间保持运行，直到测试显式放行。
+class CommandGateCodexRunner extends FakeCodexRunner {
+  final Completer<void> started = Completer<void>();
+  final Completer<void> releaseCommand = Completer<void>();
+
+  @override
+  Future<CodexRunResult> run({
+    required String prompt,
+    required String hostWorkingDir,
+    String? systemPrompt,
+    Duration? timeout,
+    required CodexEventListener listener,
+    String? guestWorkingDir,
+    bool resolveWorkspace = true,
+    List<String> images = const [],
+    String? threadId,
+    void Function(String chunk)? onStderrChunk,
+  }) async {
+    runCount++;
+    lastPrompt = prompt;
+    lastWorkingDir = hostWorkingDir;
+    lastGuestWorkingDir = guestWorkingDir;
+    lastResolveWorkspace = resolveWorkspace;
+    lastSystemPrompt = systemPrompt;
+    lastImages = images;
+    lastThreadId = threadId;
+    lastTimeout = timeout;
+    listener.onCodexEvent(const CodexThreadStarted(threadId: 'command-thread'));
+    listener.onCodexEvent(const CodexTurnStarted());
+    listener.onCodexEvent(
+      const CodexCommandStarted(id: 'slow', command: 'flutter build apk'),
+    );
+    started.complete();
+    await releaseCommand.future;
+    listener.onCodexEvent(
+      const CodexCommandCompleted(
+        id: 'slow',
+        command: 'flutter build apk',
+        exitCode: 0,
+        output: 'built',
+      ),
+    );
+    listener.onCodexEvent(const CodexAgentMessage(text: '构建完成'));
+    return const CodexRunResult(exitCode: 0);
   }
 }
 
@@ -377,6 +471,7 @@ void main() {
       expect(engine.getGenerationStatus(session.sessionId),
           GenerationStatus.completed);
       expect(engine.isGenerating(session.sessionId), isFalse);
+      expect(runner.lastTimeout, const Duration(minutes: 10));
       engine.dispose();
     });
 
@@ -752,6 +847,107 @@ void main() {
       expect(last.content, contains('api key'));
       // 无害 config 警告不进入诊断
       expect(last.content, isNot(contains('Ignored unsupported project-local config keys')));
+      engine.dispose();
+    });
+
+    test('runner 永不返回且无新事件 → 空闲看门狗结束并显示最近 stderr', () async {
+      final runner = HangingCodexRunner(
+        stderrChunk: "thread 'plugins-curated-repo-sync' panicked: "
+            'OS can\'t spawn worker thread (os error 11)',
+      );
+      final engine = CodexChatEngine(
+        runner: runner,
+        defaultWorkspaceDir: '/ws',
+        turnTimeout: const Duration(seconds: 2),
+        idleTimeout: const Duration(milliseconds: 40),
+      );
+      final session = engine.createSession();
+
+      Object? caught;
+      try {
+        await for (final _ in engine.streamMessage(
+          sessionId: session.sessionId,
+          content: 'hi',
+        )) {}
+      } catch (e) {
+        caught = e;
+      }
+
+      expect(caught, isA<ChatEngineException>());
+      expect(
+        (caught as ChatEngineException).type,
+        ChatEngineErrorType.timeout,
+      );
+      expect(runner.stopCount, 1);
+      expect(runner.lastTimeout, const Duration(seconds: 2));
+      final last = session.messages.last;
+      expect(last.isStreaming, isFalse);
+      expect(last.content, contains('长时间无输出'));
+      expect(last.content, contains('plugin'));
+      expect(last.content, contains('os error 11'));
+      expect(engine.getGenerationStatus(session.sessionId),
+          GenerationStatus.error);
+      engine.dispose();
+    });
+
+    test('runner 永不返回 → 整轮硬超时兜底，不永久 Working', () async {
+      final runner = HangingCodexRunner();
+      final engine = CodexChatEngine(
+        runner: runner,
+        defaultWorkspaceDir: '/ws',
+        turnTimeout: const Duration(milliseconds: 40),
+        idleTimeout: null,
+      );
+      final session = engine.createSession();
+
+      Object? caught;
+      try {
+        await for (final _ in engine.streamMessage(
+          sessionId: session.sessionId,
+          content: 'hi',
+        )) {}
+      } catch (e) {
+        caught = e;
+      }
+
+      expect(caught, isA<ChatEngineException>());
+      expect(
+        (caught as ChatEngineException).type,
+        ChatEngineErrorType.timeout,
+      );
+      expect(runner.stopCount, 1);
+      expect(session.messages.last.isStreaming, isFalse);
+      expect(session.messages.last.content, contains('本轮执行超过'));
+      expect(engine.getGenerationStatus(session.sessionId),
+          GenerationStatus.error);
+      engine.dispose();
+    });
+
+    test('命令执行期间暂停空闲看门狗，不误杀长时间构建', () async {
+      final runner = CommandGateCodexRunner();
+      final engine = CodexChatEngine(
+        runner: runner,
+        defaultWorkspaceDir: '/ws',
+        turnTimeout: const Duration(seconds: 2),
+        idleTimeout: const Duration(milliseconds: 30),
+      );
+      final session = engine.createSession();
+
+      final streamFuture = engine
+          .streamMessage(sessionId: session.sessionId, content: '构建 APK')
+          .toList();
+      await runner.started.future;
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+
+      expect(engine.isGenerating(session.sessionId), isTrue);
+      expect(runner.stopCount, 0);
+
+      runner.releaseCommand.complete();
+      final chunks = await streamFuture;
+      expect(chunks.join(), '构建完成');
+      expect(session.messages.last.content, '构建完成');
+      expect(engine.getGenerationStatus(session.sessionId),
+          GenerationStatus.completed);
       engine.dispose();
     });
 

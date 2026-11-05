@@ -359,6 +359,9 @@ class LinuxRuntimeProvider implements IRuntimeProvider {
   static List<String> prootBindArguments() => const [
     '--link2symlink',
     '--change-id=0:0',
+    // PRoot 退出时一并结束 tracee，避免 Codex 超时/取消后子进程仍持有
+    // stdout/stderr 管道，导致上层 cleanupTimedOut 与 UI 永久 Working。
+    '--kill-on-exit',
     '-b', '/proc',
     '-b', '/dev',
     '-b', '/sys',

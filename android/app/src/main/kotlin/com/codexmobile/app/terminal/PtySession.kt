@@ -115,13 +115,22 @@ class PtySession private constructor(
      */
     fun write(data: ByteArray) {
         checkNotDestroyed()
+        if (data.isEmpty()) return
         synchronized(writeLock) {
-            val written = PtyNative.writeToPty(ptyFd, data, 0, data.size)
-            if (written < 0) {
-                throw PtyException("PTY write failed")
-            }
-            if (written < data.size) {
-                Log.w(TAG, "PTY partial write: $written/${data.size}")
+            // PTY / 管道可能发生部分写（大段粘贴、Ctrl+V、中文 IME 提交）。
+            // 单次 write 只写一部分时继续写剩余字节，避免静默丢字。
+            var offset = 0
+            while (offset < data.size) {
+                val written = PtyNative.writeToPty(
+                    ptyFd,
+                    data,
+                    offset,
+                    data.size - offset
+                )
+                if (written <= 0) {
+                    throw PtyException("PTY write failed at $offset/${data.size}")
+                }
+                offset += written
             }
         }
     }

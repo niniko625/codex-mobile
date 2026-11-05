@@ -70,6 +70,13 @@ class RuntimeProcessRequest {
   /// 只读消费，不改变输出收集逻辑；null 表示不回调。
   final void Function(String chunk)? onStdoutChunk;
 
+  /// 流式 stderr 回调（可选）
+  ///
+  /// codex / PRoot 的启动错误通常只写入 stderr。聊天看门狗需要在进程
+  /// 尚未退出时就能展示最近错误，因此这里提供与 stdout 对称的增量回调。
+  /// 只读消费，不改变 stderr 收集逻辑；null 表示不回调。
+  final void Function(String chunk)? onStderrChunk;
+
   /// 额外的 PRoot bind 挂载（仅 runtimeId='linux' 时生效）
   ///
   /// 每项格式与 PRoot `-b` 相同：`hostPath[:guestPath]`。
@@ -98,6 +105,7 @@ class RuntimeProcessRequest {
     this.runtimeId,
     this.label,
     this.onStdoutChunk,
+    this.onStderrChunk,
     this.extraBinds,
     this.innerCommand,
   });
@@ -121,6 +129,7 @@ class RuntimeProcessRequest {
       runtimeId: runtimeId,
       label: label,
       onStdoutChunk: onStdoutChunk,
+      onStderrChunk: onStderrChunk,
       extraBinds: extraBinds,
       innerCommand: innerCommand,
     );

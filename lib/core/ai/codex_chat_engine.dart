@@ -120,6 +120,13 @@ class CodexChatEngine implements IChatEngine {
   /// 运行时解析默认工作目录（App 文档目录等）
   final Future<String> Function()? workspaceDirResolver;
 
+  /// 单轮硬超时。传给 [CodexRunner] 后由底层杀死卡死的 PRoot/codex。
+  final Duration? turnTimeout;
+
+  /// 无有效事件看门狗。命令执行期间暂停计时，避免误杀长时间构建；
+  /// 模型请求卡住（如 turn.started 后永久无 agent_message）时触发。
+  final Duration? idleTimeout;
+
   final Map<String, ChatSession> _sessions = {};
   final Map<String, GenerationStatus> _generationStatuses = {};
   final Map<String, String> _threadIds = {};
@@ -158,6 +165,8 @@ class CodexChatEngine implements IChatEngine {
     CodexRunner? runner,
     this.defaultWorkspaceDir,
     this.workspaceDirResolver,
+    this.turnTimeout = const Duration(minutes: 10),
+    this.idleTimeout = const Duration(seconds: 90),
     this.systemPrompt = '你是一个 AI 编程助手。你可以读取和修改用户项目目录里的文件、'
         '运行命令、迭代完成任务。当前工作目录是你的目标项目目录，可以直接操作其中的文件。'
         '请用简体中文回答。',
@@ -315,14 +324,83 @@ class CodexChatEngine implements IChatEngine {
     final done = Completer<CodexRunResult>();
     final toolCalls = <CodexToolCall>[];
     final textBuffer = StringBuffer();
+    final stderrTail = StringBuffer();
     var runError = '';
+    var activeCommands = 0;
+    Timer? idleTimer;
+    Timer? hardTimer;
+
+    void cancelTimers() {
+      idleTimer?.cancel();
+      idleTimer = null;
+      hardTimer?.cancel();
+      hardTimer = null;
+    }
 
     // run 结束（无论正常/取消/错误）都要 close controller，
     // 否则下方 `await for` 永不结束（死锁）
     void finishStream() {
+      cancelTimers();
       if (!controller.isClosed) {
         controller.close();
       }
+    }
+
+    String formatTimeout(Duration duration) {
+      if (duration.inSeconds >= 1) return '${duration.inSeconds} 秒';
+      return '${duration.inMilliseconds} 毫秒';
+    }
+
+    void triggerWatchdog(String reason) {
+      if (done.isCompleted) return;
+      final tail = stderrTail.toString().trim();
+      final message = StringBuffer(reason)
+        ..write('\n\n已请求强制停止本轮 Codex 进程。');
+      if (tail.isNotEmpty) {
+        message
+          ..write('\n\n最近 stderr：\n')
+          ..write(_clipDiagnostic(tail));
+      }
+      final error = message.toString();
+      runError = error;
+      done.complete(CodexRunResult(
+        exitCode: -2,
+        timedOut: true,
+        error: error,
+        stderr: tail,
+      ));
+      finishStream();
+      try {
+        _runner.stop();
+      } catch (e) {
+        LogService.warning('CodexChatEngine', '看门狗停止 Codex 失败: $e');
+      }
+    }
+
+    void resetIdleTimer() {
+      idleTimer?.cancel();
+      idleTimer = null;
+      if (idleTimeout == null || activeCommands > 0 || done.isCompleted) {
+        return;
+      }
+      idleTimer = Timer(idleTimeout!, () {
+        if (done.isCompleted || activeCommands > 0) return;
+        triggerWatchdog(
+          'Codex 长时间无输出（已等待 ${formatTimeout(idleTimeout!)}），'
+          '已停止本轮执行。',
+        );
+      });
+    }
+
+    resetIdleTimer();
+    if (turnTimeout != null) {
+      hardTimer = Timer(turnTimeout!, () {
+        if (done.isCompleted) return;
+        triggerWatchdog(
+          'Codex 本轮执行超过 ${formatTimeout(turnTimeout!)}，'
+          '已停止本轮执行。',
+        );
+      });
     }
 
     final currentThreadId = _threadIds[sessionId];
@@ -337,6 +415,19 @@ class CodexChatEngine implements IChatEngine {
           systemPrompt: systemPrompt,
           images: staged.images,
           threadId: currentThreadId,
+          timeout: turnTimeout,
+          onStderrChunk: (chunk) {
+            stderrTail.write(chunk);
+            if (stderrTail.length > 8000) {
+              final text = stderrTail.toString();
+              stderrTail
+                ..clear()
+                ..write(text.substring(text.length - 8000));
+            }
+            // 有 stderr 说明进程仍在工作/报错，重置空闲计时；命令执行
+            // 期间由 activeCommands 保持暂停，避免误杀长时间构建。
+            if (activeCommands == 0) resetIdleTimer();
+          },
           listener: _CodexEventListener(
             onEvent: (event) {
               if (!controller.isClosed) {
@@ -373,7 +464,9 @@ class CodexChatEngine implements IChatEngine {
         switch (event) {
           case CodexThreadStarted(:final threadId):
             _recordThreadId(session, threadId);
+            resetIdleTimer();
           case CodexTurnStarted():
+            resetIdleTimer();
             break;
           case CodexAgentMessage(:final text):
             if (text.isNotEmpty) {
@@ -390,7 +483,11 @@ class CodexChatEngine implements IChatEngine {
               );
               yield text;
             }
+            resetIdleTimer();
           case CodexCommandStarted(:final id, :final command):
+            activeCommands++;
+            idleTimer?.cancel();
+            idleTimer = null;
             _upsertToolCall(
               toolCalls,
               CodexToolCall(id: id, command: command, status: 'in_progress'),
@@ -431,14 +528,19 @@ class CodexChatEngine implements IChatEngine {
               workspaceGuest: workspace.guest,
               toolCalls: toolCalls,
             );
+            if (activeCommands > 0) activeCommands--;
+            resetIdleTimer();
           case CodexTurnCompleted():
+            resetIdleTimer();
             break;
           case CodexErrorEvent():
             // 无害 fallback 警告静默；真实错误由 exit 结果承载
+            resetIdleTimer();
             break;
         }
       }
     } finally {
+      cancelTimers();
       if (!controller.isClosed) {
         await controller.close();
       }

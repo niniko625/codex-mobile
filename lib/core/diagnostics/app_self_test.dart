@@ -5,6 +5,8 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../features/ai/providers/chat_provider.dart';
+import '../../features/terminal/providers/terminal_provider.dart';
+import '../../features/terminal/services/terminal_service.dart';
 import '../ai/ai_message.dart';
 import '../logger/log_service.dart';
 
@@ -74,7 +76,17 @@ class AppSelfTest {
       ..writeln('status=RUNNING');
     await _write(output);
 
-    var passed = false;
+    var terminalPassed = false;
+    var aiPassed = false;
+    try {
+      await _runTerminal(ref: ref, output: output);
+      terminalPassed = true;
+    } catch (e, stack) {
+      output
+        ..writeln('\n[terminal][error] $e')
+        ..writeln('[terminal][stack]\n$stack');
+    }
+
     try {
       final notifier = ref.read(chatProvider.notifier);
       await _waitForSessionRestore(notifier);
@@ -102,21 +114,114 @@ class AppSelfTest {
         label: '第三轮',
         output: output,
       );
-      passed = true;
+      aiPassed = true;
     } catch (e, stack) {
       output
-        ..writeln('\n[error] $e')
-        ..writeln('[stack]\n$stack');
+        ..writeln('\n[ai][error] $e')
+        ..writeln('[ai][stack]\n$stack');
     } finally {
+      final passed = terminalPassed && aiPassed;
       output
         ..writeln('\nfinishedAt=${DateTime.now().toIso8601String()}')
+        ..writeln('terminal=${terminalPassed ? 'PASS' : 'FAIL'}')
+        ..writeln('ai=${aiPassed ? 'PASS' : 'FAIL'}')
         ..writeln('status=${passed ? 'PASS' : 'FAIL'}');
       await _write(output);
       LogService.info(
         'AppSelfTest',
-        '真机自测结束: ${passed ? 'PASS' : 'FAIL'}',
+        '真机自测结束: terminal=${terminalPassed ? 'PASS' : 'FAIL'}, '
+        'ai=${aiPassed ? 'PASS' : 'FAIL'}',
       );
     }
+  }
+
+  /// 终端真机自测：直接走 Native PTY 的原始字符写入通道。
+  ///
+  /// 与终端页键盘模式使用同一个 `writeRaw` 路径，覆盖：
+  ///   - 普通字符逐段写入；
+  ///   - DEL (`\x7f`) 退格；
+  ///   - `\r` 提交回车；
+  ///   - PTY 输出回传与 Shell 实际执行结果。
+  ///
+  /// 命令里故意使用 `$((40+2))`，避免命令本身的 ECHO 文本包含
+  /// `CODEX_TERM_42` 造成假阳性。
+  static Future<void> _runTerminal({
+    required WidgetRef ref,
+    required StringBuffer output,
+  }) async {
+    const marker = 'CODEX_TERM_42';
+    final notifier = ref.read(terminalProvider.notifier);
+    String? sessionId;
+    output
+      ..writeln('\n[terminal] startedAt=${DateTime.now().toIso8601String()}')
+      ..writeln('[terminal] command=echo CODEX_TERM_4<DEL>2');
+    await _write(output);
+
+    try {
+      sessionId = await notifier
+          .createSession(name: '自测终端')
+          .timeout(const Duration(seconds: 60));
+      final sessions = ref
+          .read(terminalProvider)
+          .sessions
+          .where((item) => item.id == sessionId);
+      if (sessions.isEmpty) {
+        throw StateError('终端会话创建后未出现在状态中');
+      }
+      final session = sessions.first;
+
+      output
+        ..writeln('[terminal] sessionId=${session.id}')
+        ..writeln('[terminal] shellPath=${session.shellPath}')
+        ..writeln('[terminal] args=${session.shellInfo.args.join(' ')}')
+        ..writeln('[terminal] backend=${session.backendName}')
+        ..writeln('[terminal] status=${session.status.name}');
+      await _write(output);
+
+      if (session.status != TerminalSessionStatus.running) {
+        throw StateError('终端会话未运行: ${session.status.name}');
+      }
+
+      // 给 PRoot / bash 留出启动时间；PTY 会缓冲提前写入的输入。
+      await Future<void>.delayed(const Duration(milliseconds: 800));
+      for (final chunk in <String>[
+        'echo CODEX_TERM_4',
+        '9',
+        '\x7f',
+        '2',
+        '\r',
+      ]) {
+        notifier.writeRaw(chunk);
+        await Future<void>.delayed(const Duration(milliseconds: 60));
+      }
+
+      final deadline = DateTime.now().add(const Duration(seconds: 30));
+      while (!session.outputText.contains(marker)) {
+        if (DateTime.now().isAfter(deadline)) {
+          final tail = _tail(session.outputText);
+          throw TimeoutException('等待终端输出 $marker 超时；最近输出:\n$tail');
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 150));
+      }
+
+      output
+        ..writeln('[terminal] received=$marker')
+        ..writeln('[terminal] outputTail=${_tail(session.outputText)}')
+        ..writeln('[terminal] status=PASS')
+        ..writeln('[terminal] finishedAt=${DateTime.now().toIso8601String()}');
+      await _write(output);
+    } finally {
+      if (sessionId != null) {
+        try {
+          await notifier.closeSession(sessionId);
+        } catch (_) {}
+      }
+    }
+  }
+
+  static String _tail(String text, {int maxChars = 1200}) {
+    if (text.length <= maxChars) return text;
+    return text.substring(text.length - maxChars);
   }
 
   static Future<void> _runTurn({

@@ -439,7 +439,12 @@ void main() {
       // 内层 bash 命令：exec 前缀 + codex exec --json + $CODEX_PROMPT + </dev/null
       final lcIdx = args.indexOf('-lc');
       final innerCommand = args[lcIdx + 1];
-      expect(innerCommand, startsWith('exec /usr/local/bin/codex exec --json'));
+      expect(
+        innerCommand,
+        startsWith(
+          'exec /usr/local/bin/codex -c features.plugins=false exec --json',
+        ),
+      );
       expect(innerCommand, contains('--skip-git-repo-check'));
       expect(innerCommand, contains('--dangerously-bypass-approvals-and-sandbox'));
       expect(innerCommand, contains('"\$CODEX_PROMPT"'));
@@ -467,7 +472,13 @@ void main() {
       );
 
       final command = innerCommandOf(inner.lastRequest!);
-      expect(command, contains('exec /usr/local/bin/codex exec resume --json'));
+      expect(
+        command,
+        contains(
+          'exec /usr/local/bin/codex -c features.plugins=false '
+          'exec resume --json',
+        ),
+      );
       expect(command, contains("'019f-resume-id'"));
       expect(
         command.indexOf("'019f-resume-id'"),
@@ -872,6 +883,8 @@ void main() {
       expect(content, contains('[model_providers.deepseek]'));
       expect(content, contains('base_url = "https://api.deepseek.com"'));
       expect(content, contains('env_key = "DEEPSEEK_API_KEY"'));
+      expect(content, contains('[features]'));
+      expect(content, contains('plugins = false'));
       // 幂等标记只出现一次
       expect('[model_providers.deepseek]'.allMatches(content), hasLength(1));
     });
@@ -898,7 +911,7 @@ void main() {
           lessThan(content.indexOf('[projects."/workspace"]')));
     });
 
-    test('已有 provider 块 → 跳过（不重复写、不改动原内容）', () async {
+    test('已有 provider 块但缺 plugins → 只补写插件关闭项并保留原内容', () async {
       const original = 'model = "deepseek-flash"\n'
           '[model_providers.deepseek]\n'
           'base_url = "https://api.deepseek.com"\n';
@@ -909,7 +922,30 @@ void main() {
       final result = await runOnce();
 
       expect(result.isSuccess, isTrue);
-      expect(configFile().readAsStringSync(), original);
+      final updated = configFile().readAsStringSync();
+      expect(updated, startsWith(original.trimRight()));
+      expect(updated, contains('[features]'));
+      expect(updated, contains('plugins = false'));
+      expect('[model_providers.deepseek]'.allMatches(updated), hasLength(1));
+    });
+
+    test('已有 [features] 表 → 原地补 plugins=false，不生成重复 table', () async {
+      const original = 'model = "deepseek-flash"\n'
+          '[model_providers.deepseek]\n'
+          'base_url = "https://api.deepseek.com"\n\n'
+          '[features]\n'
+          'other_feature = true\n';
+      final dir = configFile().parent;
+      await dir.create(recursive: true);
+      await configFile().writeAsString(original);
+
+      final result = await runOnce();
+
+      expect(result.isSuccess, isTrue);
+      final updated = configFile().readAsStringSync();
+      expect(updated, contains('other_feature = true'));
+      expect(updated, contains('plugins = false'));
+      expect('[features]'.allMatches(updated), hasLength(1));
     });
 
     test('已有顶层 model 键但无 provider 定义 → 只补 provider table，不重复顶层键',

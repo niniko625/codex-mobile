@@ -217,10 +217,19 @@ name = "DeepSeek"
 base_url = "https://api.deepseek.com"
 env_key = "DEEPSEEK_API_KEY"
 wire_api = "responses"
+
+# Android 线程/内存有限；codex 0.147 默认的 curated plugin 同步线程会在
+# 资源不足时 panic（OS can't spawn worker thread），导致 turn.started 后
+# 永远没有 agent_message。聊天命令同时用 -c 覆盖，旧配置也能立即生效。
+[features]
+plugins = false
 ''';
 
   /// config.toml 已配置的幂等标记（与 npm_toolchain_installers.dart 一致）
   static const String codexConfigMarker = '[model_providers.deepseek]';
+
+  /// Codex 插件系统关闭标记。
+  static const String pluginsDisabledMarker = 'plugins = false';
 
   /// Android 宿主绝对路径特征（在 Ubuntu rootfs 内不存在 → codex 读取必 ENOENT）
   static final RegExp _hostPathPattern =
@@ -308,6 +317,7 @@ wire_api = "responses"
     String? systemPrompt,
     Duration? timeout,
     required CodexEventListener listener,
+    void Function(String chunk)? onStderrChunk,
     String? guestWorkingDir,
     bool resolveWorkspace = true,
     List<String> images = const [],
@@ -321,6 +331,7 @@ wire_api = "responses"
         systemPrompt: systemPrompt,
         timeout: timeout,
         listener: listener,
+        onStderrChunk: onStderrChunk,
         guestWorkingDir: guestWorkingDir,
         resolveWorkspace: resolveWorkspace,
         images: images,
@@ -342,6 +353,7 @@ wire_api = "responses"
     String? systemPrompt,
     Duration? timeout,
     required CodexEventListener listener,
+    void Function(String chunk)? onStderrChunk,
     String? guestWorkingDir,
     bool resolveWorkspace = true,
     List<String> images = const [],
@@ -470,6 +482,7 @@ wire_api = "responses"
         apiKey: apiKey,
         timeout: timeout,
         listener: debugListener,
+        onStderrChunk: onStderrChunk,
         guestWorkingDir: guestWorkingDir,
         images: images,
         threadId: threadId,
@@ -491,6 +504,7 @@ wire_api = "responses"
           apiKey: apiKey,
           timeout: timeout,
           listener: debugListener,
+          onStderrChunk: onStderrChunk,
           guestWorkingDir: guestWorkingDir,
           images: images,
         );
@@ -517,6 +531,7 @@ wire_api = "responses"
           apiKey: apiKey,
           timeout: timeout,
           listener: debugListener,
+          onStderrChunk: onStderrChunk,
           guestWorkingDir: guestWorkingDir,
           images: images,
           threadId: threadId,
@@ -595,7 +610,8 @@ wire_api = "responses"
   }) {
     final resuming = threadId != null && threadId.isNotEmpty;
     final sessionArg = resuming ? ' ${_shellQuote(threadId)}' : '';
-    return 'exec $codexBin exec ${resuming ? 'resume ' : ''}'
+    return 'exec $codexBin -c features.plugins=false '
+        'exec ${resuming ? 'resume ' : ''}'
         '--json --skip-git-repo-check '
         '--dangerously-bypass-approvals-and-sandbox'
         '${_buildImageArgs(images)}'
@@ -627,6 +643,7 @@ wire_api = "responses"
     required String apiKey,
     required Duration? timeout,
     required CodexEventListener listener,
+    void Function(String chunk)? onStderrChunk,
     String? guestWorkingDir,
     List<String> images = const [],
     String? threadId,
@@ -671,6 +688,7 @@ wire_api = "responses"
           currentThreadId: resolvedThreadId,
         );
       },
+      onStderrChunk: onStderrChunk,
     );
 
     final result = await _runner.run(request);
@@ -838,11 +856,13 @@ wire_api = "responses"
   /// 有效回复」。
   ///
   /// 自愈规则（幂等；只写用户级 config，不碰 API 配置/环境变量）：
-  ///   1. 已含 `[model_providers.deepseek]` → 跳过（不重复写）。
+  ///   1. 已含 `[model_providers.deepseek]` → 不再重复补 provider。
   ///   2. 文件不存在 → 创建并写完整默认内容。
   ///   3. 存在但缺 provider 块 → 保留原内容（trust 条目等），在头部补写
   ///      DeepSeek 块；若原内容已含顶层 `model`/`model_provider` 键，只补
   ///      provider table（避免 TOML 重复顶层键报错）。
+  ///   4. 首次运行前部署的旧 config 可能已有 provider、没有 `[features]`
+  ///      → 独立补写 `plugins = false`，关闭 Android 上会 panic 的插件同步。
   ///
   /// 任何失败 → LogService.warning 并返回描述，绝不阻断对话。
   static String _ensureCodexConfig(String rootfsDir) {
@@ -850,23 +870,35 @@ wire_api = "responses"
     try {
       if (configFile.existsSync()) {
         final content = configFile.readAsStringSync();
-        if (content.contains(codexConfigMarker)) {
-          return '已含 [model_providers.deepseek]，跳过（幂等）';
+        var updated = content;
+        final actions = <String>[];
+        if (!content.contains(codexConfigMarker)) {
+          final hasTopLevelModel =
+              RegExp(r'^\s*model\s*=', multiLine: true).hasMatch(content);
+          final hasTopLevelProvider = RegExp(
+            r'^\s*model_provider\s*=',
+            multiLine: true,
+          ).hasMatch(content);
+          // 原内容已有顶层 model/model_provider 键 → 只补 provider 定义，
+          // 不重复顶层键；否则补完整默认头（顶层 model + provider table）。
+          final head = (hasTopLevelModel || hasTopLevelProvider)
+              ? _deepSeekProviderBlock
+              : codexConfigToml.trimRight();
+          final tail = content.trimRight();
+          updated = tail.isEmpty ? '$head\n' : '$head\n\n$tail\n';
+          actions.add('已补写 provider 块（保留原 ${tail.split('\n').length} 行内容）');
         }
-        final hasTopLevelModel =
-            RegExp(r'^\s*model\s*=', multiLine: true).hasMatch(content);
-        final hasTopLevelProvider =
-            RegExp(r'^\s*model_provider\s*=', multiLine: true).hasMatch(content);
-        // 原内容已有顶层 model/model_provider 键 → 只补 provider 定义，
-        // 不重复顶层键；否则补完整默认头（顶层 model + provider table）。
-        final head = (hasTopLevelModel || hasTopLevelProvider)
-            ? _deepSeekProviderBlock
-            : codexConfigToml.trimRight();
-        final tail = content.trimRight();
-        final newContent =
-            tail.isEmpty ? '$head\n' : '$head\n\n$tail\n';
-        configFile.writeAsStringSync(newContent);
-        return '缺 provider 块，已补写（保留原 ${tail.split('\n').length} 行内容）';
+
+        final withPluginsDisabled = _withPluginsDisabled(updated);
+        if (withPluginsDisabled != updated) {
+          updated = withPluginsDisabled;
+          actions.add('已补写 features.plugins=false');
+        }
+        if (actions.isEmpty) {
+          return 'provider 与 features.plugins 均已配置，跳过（幂等）';
+        }
+        configFile.writeAsStringSync(updated);
+        return actions.join('；');
       }
       configFile.parent.createSync(recursive: true);
       configFile.writeAsStringSync(codexConfigToml);
@@ -883,6 +915,49 @@ wire_api = "responses"
     final idx = codexConfigToml.indexOf(codexConfigMarker);
     assert(idx >= 0);
     return codexConfigToml.substring(idx).trimLeft();
+  }
+
+  /// 幂等关闭 Codex 插件系统，兼容已有 `[features]` 表与用户其他配置。
+  ///
+  /// 不能简单追加 `[features]`：若原文件已有该表会生成重复 table，TOML
+  /// 解析失败。这里优先替换表中已有的 `plugins` 键，其次插入到表头之后，
+  /// 最后才新建该表。
+  static String _withPluginsDisabled(String content) {
+    final headerRe = RegExp(
+      r'^[ \t]*\[features\][ \t]*(?:#.*)?$',
+      multiLine: true,
+    );
+    final header = headerRe.firstMatch(content);
+    if (header == null) {
+      final tail = content.trimRight();
+      return '${tail.isEmpty ? '' : '$tail\n\n'}[features]\nplugins = false\n';
+    }
+
+    final afterHeader = content.substring(header.end);
+    final nextHeader = RegExp(
+      r'^[ \t]*\[[^\]]+\][ \t]*(?:#.*)?$',
+      multiLine: true,
+    ).firstMatch(afterHeader);
+    final sectionEnd = nextHeader == null
+        ? content.length
+        : header.end + nextHeader.start;
+    final section = content.substring(header.end, sectionEnd);
+    final pluginKey = RegExp(
+      r'^([ \t]*plugins[ \t]*=[ \t]*)([^\n#]*)(.*)$',
+      multiLine: true,
+    ).firstMatch(section);
+    if (pluginKey != null) {
+      if (pluginKey.group(2)!.trim() == 'false') return content;
+      final start = header.end + pluginKey.start;
+      final end = header.end + pluginKey.end;
+      return content.replaceRange(
+        start,
+        end,
+        '${pluginKey.group(1)}false${pluginKey.group(3)}',
+      );
+    }
+
+    return content.replaceRange(header.end, header.end, '\nplugins = false');
   }
 
   /// 读取 rootfs 内 DeepSeek API key（DS_API_KEY=）

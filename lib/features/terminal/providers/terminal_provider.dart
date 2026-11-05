@@ -120,6 +120,26 @@ class TerminalNotifier extends StateNotifier<TerminalState> {
   void writeCommand(String command) {
     if (command.trim().isEmpty) return;
     state.activeSession?.write(command);
+    _recordHistory(command);
+  }
+
+  /// 提交当前键盘输入行（字符已实时写入 PTY，此处只补 Enter）。
+  ///
+  /// 终端键盘模式会在每次字符变化时直接把增量写入 PTY，因此不能再次
+  /// 调用 [writeCommand]，否则整行命令会重复执行。本方法只发送 `\r`，
+  /// 并记录非空命令到历史。
+  void submitLine(String command) {
+    final session = state.activeSession;
+    if (session == null) return;
+    session.writeRaw('\r');
+    _recordHistory(command);
+  }
+
+  void _recordHistory(String command) {
+    if (command.trim().isEmpty) {
+      state = state.copyWith();
+      return;
+    }
 
     final sessionId = state.activeSessionId;
     if (sessionId != null) {

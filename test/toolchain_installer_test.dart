@@ -840,6 +840,8 @@ void main() {
       expect(content, contains('base_url = "https://api.deepseek.com"'));
       // 顶层 model_catalog_json 指向 rootfs 内 models.json（消除 fallback 警告）
       expect(content, contains('model_catalog_json = "/root/.codex/models.json"'));
+      expect(content, contains('[features]'));
+      expect(content, contains('plugins = false'));
       final models =
           File('${f.temp.path}/rootfs/root/.codex/models.json');
       expect(models.existsSync(), isTrue, reason: 'models.json 必须部署');
@@ -871,10 +873,11 @@ void main() {
       f.adapter.installedVersions['/usr/bin/codex'] = '0.9.0';
       final config = File('${f.temp.path}/rootfs/root/.codex/config.toml');
       config.createSync(recursive: true);
-      // 已含 DeepSeek 直连 + model_catalog_json → 幂等，完全不重写
+      // 已含 DeepSeek 直连 + model_catalog_json + 插件关闭 → 幂等
       config.writeAsStringSync('model = "custom-model"\n'
           'model_catalog_json = "/root/.codex/models.json"\n'
-          '[model_providers.deepseek]\nname = "Keep"\n');
+          '[model_providers.deepseek]\nname = "Keep"\n\n'
+          '[features]\nplugins = false\n');
 
       final installer = _codexInstaller(
         loadShellAdditions: () async => '# Codex Mobile Pro\n',
@@ -884,8 +887,33 @@ void main() {
       expect(result.success, isTrue);
       expect(config.readAsStringSync(), 'model = "custom-model"\n'
           'model_catalog_json = "/root/.codex/models.json"\n'
-          '[model_providers.deepseek]\nname = "Keep"\n',
+          '[model_providers.deepseek]\nname = "Keep"\n\n'
+          '[features]\nplugins = false\n',
           reason: '已完整配置时应保持用户自定义内容原样不覆盖');
+    });
+
+    test('旧 config 已有 provider + 模型目录但缺 plugins → 自动补写', () async {
+      final f = ToolchainFixture();
+      addTearDown(f.dispose);
+      f.adapter.installedVersions['/usr/bin/codex'] = '0.9.0';
+      final config = File('${f.temp.path}/rootfs/root/.codex/config.toml');
+      config.createSync(recursive: true);
+      const original = 'model = "custom-model"\n'
+          'model_catalog_json = "/root/.codex/models.json"\n'
+          '[model_providers.deepseek]\nname = "Keep"\n';
+      config.writeAsStringSync(original);
+
+      final installer = _codexInstaller(
+        loadShellAdditions: () async => '# Codex Mobile Pro\n',
+      );
+      final result = await installer.install(f.ctx);
+
+      expect(result.success, isTrue);
+      final upgraded = config.readAsStringSync();
+      expect(upgraded, startsWith(original.trimRight()));
+      expect(upgraded, contains('[features]'));
+      expect(upgraded, contains('plugins = false'));
+      expect('[features]'.allMatches(upgraded), hasLength(1));
     });
 
     test('config.toml 旧版本（缺 model_catalog_json）→ 顶层补写且保留用户内容',
@@ -914,6 +942,8 @@ void main() {
           isTrue, reason: 'model_catalog_json 必须补到顶层（table 之前）');
       expect(upgraded, contains('custom-model'), reason: '用户内容不被覆盖');
       expect(upgraded, contains('name = "Keep"'), reason: '用户内容不被覆盖');
+      expect(upgraded, contains('[features]'));
+      expect(upgraded, contains('plugins = false'));
     });
 
     test('Codex CLI 安装成功 → 部署 DeepSeek 模型元数据到 /root/.codex/models.json',

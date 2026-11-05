@@ -138,10 +138,20 @@ class _NativeSessionHandle extends SessionHandle {
   @override
   void write(String text) {
     if (_closed) return;
-    _channel.invokeMethod('write', {
+    final pending = _channel.invokeMethod('write', {
       'sessionId': _sessionId,
       'data': text,
     });
+    pending.then<void>(
+      (_) {},
+      onError: (Object error) {
+        if (_closed) return;
+        final message = 'PTY 写入失败: $error';
+        if (!_errorController.isClosed) {
+          _errorController.add(message);
+        }
+      },
+    );
   }
 
   @override

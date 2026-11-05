@@ -171,6 +171,8 @@ class TerminalSession {
 
   bool get isDisposed => _disposed;
   String get shellPath => shellInfo.shellPath;
+  String get backendName => _backend?.name ?? 'process';
+  bool get isNativePty => _nativeSession != null;
 
   /// 获取当前输出文本
   String get outputText {
@@ -414,6 +416,7 @@ class TerminalSession {
         _process!.stdin.write(data);
       }
     } catch (e) {
+      addOutput('写入失败: $e', isStderr: true);
       LogService.error('Terminal', '  写入原始数据失败: $e');
     }
   }

@@ -571,6 +571,22 @@ void main() {
       expect(result.cleanupTimedOut, false);
     });
 
+    test('stderr 增量实时回调（供聊天看门狗展示崩溃原因）', () async {
+      final execution = LocalProcessExecution();
+      final chunks = <String>[];
+      final result = await execution.execute(
+        RuntimeProcessRequest(
+          executable: 'sh',
+          arguments: ['-c', 'printf stream-err >&2'],
+          onStderrChunk: chunks.add,
+        ),
+      );
+
+      expect(result.isSuccess, true);
+      expect(result.stderr, 'stream-err');
+      expect(chunks.join(), 'stream-err');
+    });
+
     test('command timeout → execute 最终返回 timedOut', () async {
       final execution = quickExecution();
       final result = await execution.execute(

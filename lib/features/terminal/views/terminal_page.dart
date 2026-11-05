@@ -6,9 +6,11 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../core/i18n/app_locale.dart';
 import '../../../core/i18n/strings.dart';
+import '../../../core/logger/log_service.dart';
 import '../providers/terminal_provider.dart';
 import '../providers/terminal_settings_provider.dart';
 import '../services/terminal_service.dart';
+import '../services/terminal_input.dart';
 import '../widgets/extra_keys_toolbar.dart';
 import '../widgets/terminal_output.dart';
 
@@ -49,6 +51,13 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
   bool _autoScroll = true;
   bool _settingsVisible = false;
 
+  /// Shell 当前输入行中已经实时写入的文本。
+  ///
+  /// 软键盘每次提交字符时，只把相对该值的增量写入 PTY；按 Enter 时
+  /// 不再重发整行，避免命令重复执行。
+  String _sentInput = '';
+  bool _keyboardInputLogged = false;
+
   @override
   void initState() {
     super.initState();
@@ -62,12 +71,15 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
 
     // 打开页面时若无会话则自动创建一个，保持终端状态可用。
     // 会话生命周期由全局 TerminalProvider 持有，离开页面再进入不丢失。
-    Future.microtask(() {
+    Future.microtask(() async {
       if (!mounted) return;
       if (ref.read(terminalProvider).sessions.isEmpty) {
-        ref.read(terminalProvider.notifier).createSession();
+        await ref.read(terminalProvider.notifier).createSession();
       }
+      _requestKeyboardSoon();
     });
+
+    _commandFocusNode.addListener(_onFocusChanged);
 
     // 监听滚动事件 — 检测用户是否手动滚动
     _scrollController.addListener(_onScroll);
@@ -80,6 +92,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _refreshTimer?.cancel();
+    _commandFocusNode.removeListener(_onFocusChanged);
     _commandController.dispose();
     _commandFocusNode.dispose();
     _scrollController.removeListener(_onScroll);
@@ -134,20 +147,60 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
   }
 
   void _submitCommand() {
-    _executeCommand(_commandController.text);
+    final notifier = ref.read(terminalProvider.notifier);
+    final text = _commandController.text;
+    final delta = terminalInputDelta(
+      sentText: _sentInput,
+      nextText: text,
+    );
+    if (!delta.isEmpty) {
+      notifier.writeRaw(delta.data);
+    }
+    notifier.submitLine(text);
+    _sentInput = '';
+    _commandController.clear();
+    _scrollToBottom();
   }
 
-  /// 输入框内容变化：检测到换行（多行粘贴）立即逐行执行并清空。
+  /// 输入框内容变化：字符实时写入 PTY；多行粘贴逐行执行。
+  ///
+  /// 输入法组词期间不发送，避免拼音/候选词字母提前进入 Shell；组词提交
+  /// 后通过差分一次性发送。退格由 DEL (`\x7f`) 表达，交给 Shell/readline
+  /// 处理，这样即使输入框内容被清空也能正常删除终端中的字符。
   void _onCommandChanged(String text) {
-    if (!text.contains('\n')) return;
-    _executeCommand(text);
+    if (_commandController.value.composing.isValid) {
+      return;
+    }
+    if (!_keyboardInputLogged) {
+      _keyboardInputLogged = true;
+      LogService.info('Terminal', '键盘输入已接收，开始实时写入 PTY');
+    }
+    if (text.contains('\n') || text.contains('\r')) {
+      _executeCommand(text);
+      return;
+    }
+    final delta = terminalInputDelta(
+      sentText: _sentInput,
+      nextText: text,
+    );
+    _sentInput = delta.sentText;
+    if (!delta.isEmpty) {
+      _writeToPty(delta.data);
+      _scrollToBottom();
+    }
   }
 
   /// 执行命令：支持多行文本（粘贴脚本），逐行过滤后写入终端
   void _executeCommand(String text) {
-    final commands = splitCommandLines(text);
+    final commands = splitCommandLines(
+      text.replaceAll('\r\n', '\n').replaceAll('\r', '\n'),
+    );
     if (commands.isEmpty) return;
     final provider = ref.read(terminalProvider.notifier);
+    if (_sentInput.isNotEmpty) {
+      provider.writeRaw(terminalBackspacesFor(_sentInput));
+    }
+    _sentInput = '';
     for (final cmd in commands) {
       provider.writeCommand(cmd);
     }
@@ -173,12 +226,64 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
     ref.read(terminalProvider.notifier).writeRaw(data);
   }
 
+  /// 主动请求输入焦点并显示软键盘。
+  ///
+  /// `autofocus` 在路由切换、键盘被系统收起或会话异步创建完成后不一定
+  /// 仍然有效，因此在页面打开、点击终端区域和新建会话后都显式请求一次。
+  void _requestKeyboard() {
+    if (!mounted) return;
+    _commandFocusNode.requestFocus();
+    unawaited(
+      SystemChannels.textInput
+          .invokeMethod<void>('TextInput.show')
+          .catchError((Object _) {}),
+    );
+  }
+
+  /// 等到 TextField 完成挂载后再请求焦点，并在首帧后补一次。
+  ///
+  /// Android 上 `FocusNode.requestFocus()` 在 TextField 尚未挂载时只会
+  /// 改变焦点状态，不会连接输入法；因此页面打开和新建会话都走这里。
+  void _requestKeyboardSoon() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _requestKeyboard();
+      Future<void>.delayed(const Duration(milliseconds: 120), () {
+        if (mounted && !_commandFocusNode.hasFocus) _requestKeyboard();
+      });
+    });
+  }
+
+  void _onFocusChanged() {
+    LogService.info(
+      'Terminal',
+      '输入框焦点: ${_commandFocusNode.hasFocus ? 'focused' : 'unfocused'}',
+    );
+  }
+
+  /// 历史命令回填：同步替换 Shell 当前输入行，避免旧字符残留。
+  void _applyHistoryCommand(String? command) {
+    final next = command ?? '';
+    final notifier = ref.read(terminalProvider.notifier);
+    if (_sentInput.isNotEmpty) {
+      notifier.writeRaw(terminalBackspacesFor(_sentInput));
+    }
+    if (next.isNotEmpty) {
+      notifier.writeRaw(next);
+    }
+    _sentInput = next;
+    _commandController.value = TextEditingValue(
+      text: next,
+      selection: TextSelection.collapsed(offset: next.length),
+    );
+  }
+
   /// 点击终端区域：收起设置面板 + 重新获得输入焦点
   void _onTerminalTap() {
     if (_settingsVisible) {
       setState(() => _settingsVisible = false);
     }
-    _commandFocusNode.requestFocus();
+    _requestKeyboard();
   }
 
   @override
@@ -222,8 +327,10 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
           IconButton(
             icon: const Icon(Icons.add, color: kTerminalText),
             tooltip: s.terminalNew,
-            onPressed: () =>
-                ref.read(terminalProvider.notifier).createSession(),
+            onPressed: () async {
+              await ref.read(terminalProvider.notifier).createSession();
+              _requestKeyboardSoon();
+            },
           ),
           // 3. 清空 / 关闭终端
           PopupMenuButton<String>(
@@ -407,22 +514,12 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
                 const SingleActivator(LogicalKeyboardKey.arrowUp): () {
                   final cmd =
                       ref.read(terminalProvider.notifier).historyUp();
-                  if (cmd != null) {
-                    _commandController.text = cmd;
-                    _commandController.selection = TextSelection.fromPosition(
-                      TextPosition(offset: cmd.length),
-                    );
-                  }
+                  if (cmd != null) _applyHistoryCommand(cmd);
                 },
                 const SingleActivator(LogicalKeyboardKey.arrowDown): () {
                   final cmd =
                       ref.read(terminalProvider.notifier).historyDown();
-                  _commandController.text = cmd ?? '';
-                  if (cmd != null) {
-                    _commandController.selection = TextSelection.fromPosition(
-                      TextPosition(offset: cmd.length),
-                    );
-                  }
+                  _applyHistoryCommand(cmd);
                 },
               },
               child: TextField(
@@ -446,6 +543,12 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
                   color: kTerminalText,
                 ),
                 cursorColor: settings.cursorColor,
+                keyboardType: TextInputType.text,
+                textCapitalization: TextCapitalization.none,
+                autocorrect: false,
+                enableSuggestions: false,
+                smartDashesType: SmartDashesType.disabled,
+                smartQuotesType: SmartQuotesType.disabled,
                 minLines: 1,
                 maxLines: 4,
                 textInputAction: TextInputAction.send,
@@ -459,7 +562,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
           // 发送按钮
           IconButton(
             icon: const Icon(Icons.send, size: 18, color: kTerminalText),
-            tooltip: '发送',
+            tooltip: '执行回车',
             visualDensity: VisualDensity.compact,
             onPressed: _submitCommand,
           ),
