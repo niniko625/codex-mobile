@@ -1,0 +1,104 @@
+Analyzing codex-mobile...                                       
+
+   info • The value of the argument is redundant because it matches the default value. Try removing the argument • lib/core/ai/codex_app_server_client.dart:125:20 • avoid_redundant_argument_values
+   info • Uncancelled instance of 'StreamSubscription'. Try invoking 'cancel' in the function in which the 'StreamSubscription' was created • lib/core/ai/codex_app_server_client.dart:370:31 • cancel_subscriptions
+   info • Uncancelled instance of 'StreamSubscription'. Try invoking 'cancel' in the function in which the 'StreamSubscription' was created • lib/core/ai/codex_app_server_client.dart:371:31 • cancel_subscriptions
+   info • The value of the argument is redundant because it matches the default value. Try removing the argument • lib/core/ai/codex_app_server_client.dart:524:25 • avoid_redundant_argument_values
+   info • Sort directive sections alphabetically. Try sorting the directives • lib/core/router/app_router.dart:20:1 • directives_ordering
+   info • The value of the argument is redundant because it matches the default value. Try removing the argument • lib/core/theme/app_theme.dart:33:19 • avoid_redundant_argument_values
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • lib/features/ai/views/ai_chat_page.dart:1635:13 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • lib/features/ai/views/ai_chat_page.dart:1637:22 • prefer_const_constructors
+   info • Use 'const' literals as arguments to constructors of '@immutable' classes. Try adding 'const' before the literal • lib/features/ai/views/ai_chat_page.dart:1639:27 • prefer_const_literals_to_create_immutables
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • lib/features/ai/views/ai_chat_page.dart:1649:19 • prefer_const_constructors
+   info • Invalid use of a private type in a public API. Try making the private type public, or making the API that uses the private type also be private • lib/features/editor/extensions/code_review.dart:346:20 • library_private_types_in_public_api
+   info • Invalid use of a private type in a public API. Try making the private type public, or making the API that uses the private type also be private • lib/features/editor/extensions/code_review.dart:347:23 • library_private_types_in_public_api
+   info • Statements in an if should be enclosed in a block. Try wrapping the statement in a block • lib/features/editor/extensions/fix_error.dart:288:37 • curly_braces_in_flow_control_structures
+   info • Statements in an if should be enclosed in a block. Try wrapping the statement in a block • lib/features/editor/extensions/fix_error.dart:289:36 • curly_braces_in_flow_control_structures
+   info • Statements in an if should be enclosed in a block. Try wrapping the statement in a block • lib/features/editor/extensions/fix_error.dart:290:18 • curly_braces_in_flow_control_structures
+   info • Statements in an if should be enclosed in a block. Try wrapping the statement in a block • lib/features/editor/extensions/refactor_code.dart:163:37 • curly_braces_in_flow_control_structures
+   info • Statements in an if should be enclosed in a block. Try wrapping the statement in a block • lib/features/editor/extensions/refactor_code.dart:164:36 • curly_braces_in_flow_control_structures
+   info • Statements in an if should be enclosed in a block. Try wrapping the statement in a block • lib/features/editor/extensions/refactor_code.dart:165:18 • curly_braces_in_flow_control_structures
+   info • Don't use 'BuildContext's across async gaps. Try rewriting the code to not use the 'BuildContext', or guard the use with a 'mounted' check • lib/features/editor/views/editor_page.dart:297:16 • use_build_context_synchronously
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • lib/features/home/views/home_page.dart:131:11 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • lib/features/home/views/home_page.dart:181:11 • prefer_const_constructors
+   info • The value of the argument is redundant because it matches the default value. Try removing the argument • lib/features/home/views/home_page.dart:243:24 • avoid_redundant_argument_values
+   info • Sort directive sections alphabetically. Try sorting the directives • lib/features/terminal/services/terminal_service.dart:14:1 • directives_ordering
+   info • Sort directive sections alphabetically. Try sorting the directives • lib/features/terminal/views/terminal_page.dart:13:1 • directives_ordering
+   info • The value of the argument is redundant because it matches the default value. Try removing the argument • lib/features/terminal/views/terminal_page.dart:595:37 • avoid_redundant_argument_values
+   info • Use the '??' operator rather than '?:' when testing for 'null'. Try rewriting the code to use '??' • lib/runtime/environment_doctor.dart:228:11 • prefer_if_null_operators
+   info • Local variables should be final. Try making the variable final • lib/runtime/installers/qwen_mm_plugins_installer.dart:115:7 • prefer_final_locals
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • lib/runtime/runtime_manifest.dart:359:12 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • lib/runtime/runtime_manifest.dart:365:9 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • lib/runtime/runtime_manifest.dart:396:9 • prefer_const_constructors
+   info • Unnecessary braces in a string interpolation. Try removing the braces • test/artifact_manager_test.dart:214:25 • unnecessary_brace_in_string_interps
+   info • Unnecessary braces in a string interpolation. Try removing the braces • test/artifact_manager_test.dart:215:18 • unnecessary_brace_in_string_interps
+   info • Unnecessary braces in a string interpolation. Try removing the braces • test/artifact_manager_test.dart:249:25 • unnecessary_brace_in_string_interps
+   info • Unnecessary braces in a string interpolation. Try removing the braces • test/artifact_manager_test.dart:250:18 • unnecessary_brace_in_string_interps
+   info • Unnecessary braces in a string interpolation. Try removing the braces • test/artifact_manager_test.dart:271:25 • unnecessary_brace_in_string_interps
+   info • Unnecessary braces in a string interpolation. Try removing the braces • test/artifact_manager_test.dart:272:18 • unnecessary_brace_in_string_interps
+   info • Unnecessary braces in a string interpolation. Try removing the braces • test/artifact_manager_test.dart:291:25 • unnecessary_brace_in_string_interps
+   info • Unnecessary braces in a string interpolation. Try removing the braces • test/artifact_manager_test.dart:292:18 • unnecessary_brace_in_string_interps
+   info • Unnecessary braces in a string interpolation. Try removing the braces • test/artifact_manager_test.dart:327:25 • unnecessary_brace_in_string_interps
+   info • Unnecessary braces in a string interpolation. Try removing the braces • test/artifact_manager_test.dart:328:18 • unnecessary_brace_in_string_interps
+   info • Dangling library doc comment. Add a 'library' directive after the library comment • test/capability/fake_runner.dart:1:1 • dangling_library_doc_comments
+   info • The value of the argument is redundant because it matches the default value. Try removing the argument • test/capability/fake_runner.dart:58:17 • avoid_redundant_argument_values
+   info • The value of the argument is redundant because it matches the default value. Try removing the argument • test/capability/fake_runner.dart:66:17 • avoid_redundant_argument_values
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/capability/fake_runner.dart:85:28 • prefer_const_constructors
+   info • Dangling library doc comment. Add a 'library' directive after the library comment • test/capability/mock_provider.dart:1:1 • dangling_library_doc_comments
+   info • The value of the argument is redundant because it matches the default value. Try removing the argument • test/codex_runner_test.dart:111:15 • avoid_redundant_argument_values
+   info • The value of the argument is redundant because it matches the default value. Try removing the argument • test/codex_runner_test.dart:112:15 • avoid_redundant_argument_values
+   info • Use 'const' for final variables initialized to a constant value. Try replacing 'final' with 'const' • test/install_lock_test.dart:92:7 • prefer_const_declarations
+   info • Sort directive sections alphabetically. Try sorting the directives • test/process_runner_test.dart:21:1 • directives_ordering
+   info • Sort directive sections alphabetically. Try sorting the directives • test/process_runner_test.dart:22:1 • directives_ordering
+   info • Sort directive sections alphabetically. Try sorting the directives • test/process_runner_test.dart:23:1 • directives_ordering
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:33:19 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:46:19 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:69:19 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:83:19 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:93:19 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:102:19 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:121:27 • prefer_const_constructors
+   info • The value of the argument is redundant because it matches the default value. Try removing the argument • test/process_runner_test.dart:127:17 • avoid_redundant_argument_values
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:212:19 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:222:22 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:225:18 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:233:22 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:236:18 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:244:22 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:247:18 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:255:22 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:257:18 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:265:26 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:280:26 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:295:26 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:306:19 • prefer_const_constructors
+   info • The value of the argument is redundant because it matches the default value. Try removing the argument • test/process_runner_test.dart:387:21 • avoid_redundant_argument_values
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:413:19 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:420:19 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:430:19 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:440:19 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:451:9 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:462:9 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:476:9 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:489:19 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:504:19 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:517:19 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:549:9 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:562:9 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:593:9 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:609:9 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:631:9 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:649:9 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:670:9 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:683:9 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:699:9 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:712:9 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:727:9 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:744:9 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:757:9 • prefer_const_constructors
+   info • Use 'const' with the constructor to improve performance. Try adding the 'const' keyword to the constructor invocation • test/process_runner_test.dart:772:9 • prefer_const_constructors
+   info • Sort directive sections alphabetically. Try sorting the directives • test/runtime_provider_test.dart:18:1 • directives_ordering
+   info • The value of the argument is redundant because it matches the default value. Try removing the argument • test/terminal_input_test.dart:53:20 • avoid_redundant_argument_values
+   info • Invalid use of a private type in a public API. Try making the private type public, or making the API that uses the private type also be private • test/workspace_context_test.dart:78:8 • library_private_types_in_public_api
+
+100 issues found. (ran in 11.8s)
