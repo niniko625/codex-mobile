@@ -31,7 +31,7 @@ class AppSelfTest {
 
     if (!_listening) {
       _listening = true;
-      await const MethodChannel(_channelName).setMethodCallHandler((call) async {
+      const MethodChannel(_channelName).setMethodCallHandler((call) async {
         if (call.method != 'selfTestRequested') return null;
         await runIfRequested(ref);
         return null;
