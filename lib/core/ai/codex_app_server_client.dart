@@ -20,7 +20,6 @@ import 'dart:convert';
 import 'dart:io';
 
 import '../../core/logger/log_service.dart';
-import '../../runtime/process/runner_models.dart';
 import '../../runtime/provider/linux_runtime_provider.dart';
 import 'codex_runner.dart';
 
@@ -395,7 +394,7 @@ class CodexAppServerClient {
 
   bool get isRunning => _initialized && _transport != null;
   String? get workspaceHost => _workspaceHost;
-  String? get stderrTail => _stderrTail.toString();
+  String get stderrTail => _stderrTail.toString();
 
   /// 确保 app-server 已启动并完成握手。
   Future<void> ensureStarted({

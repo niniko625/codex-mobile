@@ -753,7 +753,6 @@ class CodexChatEngine implements IChatEngine {
     required ChatSession session,
     required String sessionId,
     required ({
-      String requested,
       String host,
       String guest,
       String resolvedHost,
