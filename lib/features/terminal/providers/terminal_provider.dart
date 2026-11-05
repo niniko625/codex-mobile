@@ -72,8 +72,16 @@ class TerminalNotifier extends StateNotifier<TerminalState> {
         super(const TerminalState());
 
   /// 创建新终端会话（异步）
-  Future<String> createSession({String? name, String? cwd}) async {
-    final session = await _service.createSession(name: name, cwd: cwd);
+  Future<String> createSession({
+    String? name,
+    String? cwd,
+    TerminalLaunchMode launchMode = TerminalLaunchMode.shell,
+  }) async {
+    final session = await _service.createSession(
+      name: name,
+      cwd: cwd,
+      launchMode: launchMode,
+    );
     final history = Map<String, List<String>>.from(state.commandHistory);
     final histIdx = Map<String, int>.from(state.historyIndex);
     history[session.id] = [];
@@ -210,7 +218,7 @@ class TerminalNotifier extends StateNotifier<TerminalState> {
   void clearActiveOutput() {
     final session = state.activeSession;
     if (session == null) return;
-    session.outputBuffer.clear();
+    session.clearOutput();
     state = state.copyWith();
   }
 

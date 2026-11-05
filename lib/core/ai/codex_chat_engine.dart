@@ -28,6 +28,7 @@ import 'ai_message.dart';
 import 'attachment.dart';
 import 'chat_engine.dart';
 import 'chat_session.dart';
+import 'codex_app_server_client.dart';
 import 'codex_runner.dart';
 import 'workspace_dir_resolver.dart';
 
@@ -114,6 +115,9 @@ class CodexChatEngine implements IChatEngine {
 
   final CodexRunner _runner;
 
+  /// 生产默认使用长驻 app-server；测试注入 runner 时保持旧执行路径。
+  final CodexAppServerClient? _appServer;
+
   /// 默认工作目录（测试注入；null 时运行时解析 App 文档目录）
   final String? defaultWorkspaceDir;
 
@@ -154,6 +158,13 @@ class CodexChatEngine implements IChatEngine {
   /// 每会话正在运行的 run（供 stopGeneration）
   final Map<String, CodexRunner> _activeRunners = {};
 
+  /// app-server 模式下的在途 turn（供停止/中断与断线清理）
+  final Map<
+    String,
+    ({CodexAppServerClient client, CodexAppServerTurn turn, String threadId})
+  >
+      _activeAppServerTurns = {};
+
   /// 明确由用户点击“停止”触发的会话。用于区分用户主动停止与意外取消：
   /// 后者意味着 cancel 信号污染了新的执行，需要显示错误并落盘诊断。
   final Set<String> _userStoppedSessions = {};
@@ -163,6 +174,7 @@ class CodexChatEngine implements IChatEngine {
 
   CodexChatEngine({
     CodexRunner? runner,
+    CodexAppServerClient? appServerClient,
     this.defaultWorkspaceDir,
     this.workspaceDirResolver,
     this.turnTimeout = const Duration(minutes: 10),
@@ -170,7 +182,9 @@ class CodexChatEngine implements IChatEngine {
     this.systemPrompt = '你是一个 AI 编程助手。你可以读取和修改用户项目目录里的文件、'
         '运行命令、迭代完成任务。当前工作目录是你的目标项目目录，可以直接操作其中的文件。'
         '请用简体中文回答。',
-  }) : _runner = runner ?? CodexRunner();
+  }) : _runner = runner ?? CodexRunner(),
+       _appServer = appServerClient ??
+           (runner == null ? CodexAppServerClient() : null);
 
   // ── Session 管理 ────────────────────────────────────────────
 
@@ -209,6 +223,7 @@ class CodexChatEngine implements IChatEngine {
     _threadIds.remove(sessionId);
     _resolvedWorkspaceDirs.remove(sessionId);
     _activeRunners.remove(sessionId);
+    _activeAppServerTurns.remove(sessionId);
   }
 
   @override
@@ -315,6 +330,21 @@ class CodexChatEngine implements IChatEngine {
         'codex_tool_calls': <Map<String, dynamic>>[],
       },
     ));
+
+    if (_appServer != null) {
+      // app-server 与 exec 使用同一套挂载约定：host 的 requested 根固定
+      // bind 到 guest /workspace，Codex cwd 只是其子目录（workspace.guest）。
+      // 因此附件 guest 路径无需重映射，否则会把项目根错当成 cwd 的绑定点。
+      yield* _streamViaAppServer(
+        session: session,
+        sessionId: sessionId,
+        workspace: workspace,
+        requestPrompt: requestPrompt,
+        imagePaths: staged.images,
+        placeholderId: placeholderId,
+      );
+      return;
+    }
 
     _generationStatuses[sessionId] = GenerationStatus.streaming;
     _activeRunners[sessionId] = _runner;
@@ -616,7 +646,12 @@ class CodexChatEngine implements IChatEngine {
           : '执行超时（exitCode=${result.exitCode}）';
       final diagnosticPath = await _exportRunDiagnostics(
         sessionId: sessionId,
-        workspace: workspace,
+        workspace: (
+          host: workspace.host,
+          guest: workspace.guest,
+          resolvedHost: workspace.resolvedHost,
+          isGit: workspace.isGit,
+        ),
         result: result,
         toolCalls: toolCalls,
         generatedChars: textBuffer.length,
@@ -709,6 +744,369 @@ class CodexChatEngine implements IChatEngine {
     }
   }
 
+  /// 长驻 app-server 版单轮对话。
+  ///
+  /// 事件来自 [CodexAppServerTurn]（JSON-RPC 通知适配后的 [CodexEvent]）。
+  /// 无论正常完成、失败、进程断开、看门狗超时还是用户停止，都会在收尾时
+  /// 复位 [GenerationStatus]，避免 UI 永久停在 working。
+  Stream<String> _streamViaAppServer({
+    required ChatSession session,
+    required String sessionId,
+    required ({
+      String requested,
+      String host,
+      String guest,
+      String resolvedHost,
+      bool isGit,
+    })
+    workspace,
+    required String requestPrompt,
+    required List<String> imagePaths,
+    required String placeholderId,
+  }) async* {
+    final client = _appServer!;
+    final toolCalls = <CodexToolCall>[];
+    final textBuffer = StringBuffer();
+    var activeCommands = 0;
+    var failure = '';
+    var lastError = '';
+    var closed = false;
+    Timer? idleTimer;
+    Timer? hardTimer;
+    CodexAppServerTurn? activeTurn;
+    String? threadId;
+
+    _generationStatuses[sessionId] = GenerationStatus.streaming;
+
+    void cancelTimers() {
+      idleTimer?.cancel();
+      idleTimer = null;
+      hardTimer?.cancel();
+      hardTimer = null;
+    }
+
+    String formatTimeout(Duration duration) {
+      if (duration.inSeconds >= 1) return '${duration.inSeconds} 秒';
+      return '${duration.inMilliseconds} 毫秒';
+    }
+
+    void stopWithError(String message) {
+      if (closed) return;
+      closed = true;
+      failure = message;
+      cancelTimers();
+      final turn = activeTurn;
+      final turnId = turn?.turnId;
+      if (turn != null && turnId != null && turnId.isNotEmpty) {
+        unawaited(client.interruptTurn(threadId: turn.threadId, turnId: turnId));
+      }
+      turn?.detach();
+    }
+
+    void resetIdleTimer() {
+      idleTimer?.cancel();
+      idleTimer = null;
+      if (idleTimeout == null || activeCommands > 0 || closed) {
+        return;
+      }
+      idleTimer = Timer(idleTimeout!, () {
+        if (closed || activeCommands > 0) return;
+        stopWithError(
+          'Codex 长时间无输出（已等待 ${formatTimeout(idleTimeout!)}），'
+          '已停止本轮执行。',
+        );
+      });
+    }
+
+    try {
+      await client.ensureStarted(
+        hostWorkspaceDir: workspace.host,
+        guestWorkingDirectory: workspace.guest,
+      );
+      if (_userStoppedSessions.remove(sessionId)) return;
+
+      final savedThreadId = _threadIds[sessionId];
+      if (savedThreadId != null && savedThreadId.isNotEmpty) {
+        try {
+          await client.ensureThread(
+            threadId: savedThreadId,
+            cwd: workspace.guest,
+            developerInstructions: systemPrompt,
+          );
+          threadId = savedThreadId;
+        } on CodexAppServerThreadResumeException catch (e) {
+          LogService.warning(
+            'CodexChatEngine',
+            '恢复 thread 失败，改为新会话: $e',
+          );
+        }
+      }
+      final resolvedThreadId = threadId ??
+          await client.startThread(
+            cwd: workspace.guest,
+            developerInstructions: systemPrompt,
+          );
+      threadId = resolvedThreadId;
+      _recordThreadId(session, resolvedThreadId);
+
+      if (_userStoppedSessions.remove(sessionId)) return;
+
+      final input = <Map<String, dynamic>>[
+        {'type': 'text', 'text': requestPrompt},
+        for (final path in imagePaths) {'type': 'localImage', 'path': path},
+      ];
+      final turn = await client.startTurn(
+        threadId: resolvedThreadId,
+        input: input,
+      );
+      activeTurn = turn;
+      _activeAppServerTurns[sessionId] = (
+        client: client,
+        turn: turn,
+        threadId: resolvedThreadId,
+      );
+
+      // turn/start 在途期间用户点击停止：此刻才拿到 turnId，必须立即补发
+      // interrupt 并退出，否则该 turn 会在后台继续运行、污染后续状态。
+      if (_userStoppedSessions.remove(sessionId)) {
+        final turnId = turn.turnId;
+        if (turnId != null && turnId.isNotEmpty) {
+          unawaited(client.interruptTurn(
+            threadId: resolvedThreadId,
+            turnId: turnId,
+          ));
+        }
+        turn.detach();
+        return;
+      }
+
+      resetIdleTimer();
+      if (turnTimeout != null) {
+        hardTimer = Timer(turnTimeout!, () {
+          if (closed) return;
+          stopWithError(
+            'Codex 本轮执行超过 ${formatTimeout(turnTimeout!)}，'
+            '已停止本轮执行。',
+          );
+        });
+      }
+
+      await for (final event in turn.events) {
+        switch (event) {
+          case CodexThreadStarted():
+            break;
+          case CodexTurnStarted():
+            resetIdleTimer();
+          case CodexAgentMessage(:final text):
+            if (text.isNotEmpty) {
+              textBuffer.write(text);
+              _updatePlaceholder(
+                session,
+                placeholderId,
+                content: textBuffer.toString(),
+                workspaceHost: workspace.host,
+                workspaceGuest: workspace.guest,
+                toolCalls: toolCalls,
+              );
+              yield text;
+            }
+            resetIdleTimer();
+          case CodexCommandStarted(:final id, :final command):
+            activeCommands++;
+            idleTimer?.cancel();
+            idleTimer = null;
+            _upsertToolCall(
+              toolCalls,
+              CodexToolCall(
+                id: id,
+                command: command,
+                status: 'in_progress',
+              ),
+            );
+            _updatePlaceholder(
+              session,
+              placeholderId,
+              content: textBuffer.toString(),
+              workspaceHost: workspace.host,
+              workspaceGuest: workspace.guest,
+              toolCalls: toolCalls,
+            );
+          case CodexCommandCompleted(
+            :final id,
+            :final command,
+            :final exitCode,
+            :final output,
+          ):
+            _upsertToolCall(
+              toolCalls,
+              CodexToolCall(
+                id: id,
+                command: command,
+                status: exitCode == 0 ? 'completed' : 'error',
+                exitCode: exitCode,
+                output: output,
+              ),
+            );
+            _updatePlaceholder(
+              session,
+              placeholderId,
+              content: textBuffer.toString(),
+              workspaceHost: workspace.host,
+              workspaceGuest: workspace.guest,
+              toolCalls: toolCalls,
+            );
+            if (activeCommands > 0) activeCommands--;
+            resetIdleTimer();
+          case CodexTurnCompleted(:final interrupted):
+            if (interrupted) lastError = 'Codex turn 已中断';
+            resetIdleTimer();
+          case CodexErrorEvent(:final message):
+            lastError = message;
+            // 重试/失败提示必须立刻上屏；否则占位消息为空时 UI 会一直
+            // 显示 working，用户看不到任何原因。
+            if (textBuffer.isEmpty) {
+              _updatePlaceholder(
+                session,
+                placeholderId,
+                content: '⏳ $message',
+                workspaceHost: workspace.host,
+                workspaceGuest: workspace.guest,
+                toolCalls: toolCalls,
+              );
+            }
+            resetIdleTimer();
+        }
+      }
+    } catch (e) {
+      if (failure.isEmpty) {
+        failure = 'Codex app-server 执行失败: $e';
+      }
+    } finally {
+      cancelTimers();
+      _activeAppServerTurns.remove(sessionId);
+    }
+
+    final userStopped = _userStoppedSessions.remove(sessionId);
+    if (userStopped) return;
+
+    final turn = activeTurn;
+    if (failure.isEmpty) {
+      failure = turn?.failure ?? '';
+    }
+    if (failure.isEmpty && (turn?.interrupted ?? false)) {
+      failure = 'Codex turn 已中断';
+    }
+    if (failure.isEmpty && textBuffer.isEmpty && lastError.isNotEmpty) {
+      failure = lastError;
+    }
+
+    final result = CodexRunResult(
+      exitCode: failure.isEmpty ? 0 : -1,
+      threadId: threadId,
+      stderr: client.stderrTail,
+      error: failure.isEmpty ? null : failure,
+    );
+
+    if (failure.isNotEmpty) {
+      _generationStatuses[sessionId] = GenerationStatus.error;
+      final diagnosticPath = await _exportRunDiagnostics(
+        sessionId: sessionId,
+        workspace: (
+          host: workspace.host,
+          guest: workspace.guest,
+          resolvedHost: workspace.resolvedHost,
+          isGit: workspace.isGit,
+        ),
+        result: result,
+        toolCalls: toolCalls,
+        generatedChars: textBuffer.length,
+        userStopped: false,
+      );
+      final visible = textBuffer.toString().trimRight();
+      final parts = <String>[
+        if (visible.isNotEmpty) visible,
+        '❌ $failure',
+        if (diagnosticPath != null) '诊断日志：$diagnosticPath',
+      ];
+      session.replaceLastMessage(ChatMessage(
+        id: _generateId(),
+        role: ChatRole.assistant,
+        content: parts.join('\n\n'),
+        timestamp: DateTime.now(),
+        metadata: {
+          'error': failure,
+          'threadId': threadId,
+          'workspaceDir': workspace.host,
+          'workspaceDirGuest': workspace.guest,
+          'codex_tool_calls': toolCalls.map((t) => t.toJson()).toList(),
+          if (diagnosticPath != null) 'diagnosticLog': diagnosticPath,
+        },
+      ));
+      throw ChatEngineException(
+        type: ChatEngineErrorType.internal,
+        message: failure,
+      );
+    }
+
+    final fullContent = textBuffer.toString();
+    if (fullContent.isEmpty) {
+      _generationStatuses[sessionId] = GenerationStatus.error;
+      final diagnosticPath = await _exportRunDiagnostics(
+        sessionId: sessionId,
+        workspace: (
+          host: workspace.host,
+          guest: workspace.guest,
+          resolvedHost: workspace.resolvedHost,
+          isGit: workspace.isGit,
+        ),
+        result: result,
+        toolCalls: toolCalls,
+        generatedChars: 0,
+        userStopped: false,
+      );
+      final stderrTail = client.stderrTail.trim();
+      final content = <String>[
+        '⚠️ 未收到有效回复',
+        'Codex app-server 未返回 agentMessage。',
+        'threadId=${threadId ?? "(null)"}',
+        if (stderrTail.isNotEmpty) 'stderr：\n${_clipDiagnostic(stderrTail)}',
+        if (diagnosticPath != null) '诊断日志：$diagnosticPath',
+      ].join('\n\n');
+      session.replaceLastMessage(ChatMessage(
+        id: _generateId(),
+        role: ChatRole.assistant,
+        content: content,
+        timestamp: DateTime.now(),
+        metadata: {
+          'threadId': threadId,
+          'workspaceDir': workspace.host,
+          'workspaceDirGuest': workspace.guest,
+          'codex_tool_calls': toolCalls.map((t) => t.toJson()).toList(),
+          if (diagnosticPath != null) 'diagnosticLog': diagnosticPath,
+        },
+      ));
+      throw const ChatEngineException(
+        type: ChatEngineErrorType.internal,
+        message: '未收到有效回复',
+      );
+    }
+
+    _generationStatuses[sessionId] = GenerationStatus.completed;
+    session.replaceLastMessage(ChatMessage(
+      id: _generateId(),
+      role: ChatRole.assistant,
+      content: fullContent,
+      timestamp: DateTime.now(),
+      metadata: {
+        'threadId': threadId,
+        'exitCode': '0',
+        'workspaceDir': workspace.host,
+        'workspaceDirGuest': workspace.guest,
+        'codex_tool_calls': toolCalls.map((t) => t.toJson()).toList(),
+      },
+    ));
+  }
+
   @override
   Future<ChatMessage> retryLastMessage(String sessionId) async {
     final session = _getSessionOrThrow(sessionId);
@@ -752,10 +1150,25 @@ class CodexChatEngine implements IChatEngine {
       return;
     }
 
-    final runner = _activeRunners.remove(sessionId);
-    if (runner != null) {
-      _userStoppedSessions.add(sessionId);
-      runner.stop();
+    // 启动阶段也可能被停止（app-server 尚未返回 turn）：先记录用户意图，
+    // _streamViaAppServer 在下一个检查点直接退出。
+    _userStoppedSessions.add(sessionId);
+
+    final appTurn = _activeAppServerTurns.remove(sessionId);
+    if (appTurn != null) {
+      final turnId = appTurn.turn.turnId;
+      if (turnId != null && turnId.isNotEmpty) {
+        unawaited(appTurn.client.interruptTurn(
+          threadId: appTurn.threadId,
+          turnId: turnId,
+        ));
+      }
+      appTurn.turn.detach();
+    } else {
+      final runner = _activeRunners.remove(sessionId);
+      if (runner != null) {
+        runner.stop();
+      }
     }
     _generationStatuses[sessionId] = GenerationStatus.completed;
 
@@ -804,10 +1217,12 @@ class CodexChatEngine implements IChatEngine {
     for (final sessionId in _sessions.keys.toList()) {
       stopGeneration(sessionId);
     }
+    unawaited(_appServer?.shutdown());
     _sessions.clear();
     _generationStatuses.clear();
     _threadIds.clear();
     _activeRunners.clear();
+    _activeAppServerTurns.clear();
     _userStoppedSessions.clear();
   }
 

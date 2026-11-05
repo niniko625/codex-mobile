@@ -559,6 +559,100 @@ class LinuxRuntimeProvider implements IRuntimeProvider {
     );
   }
 
+  /// 构建完整 Codex TUI 启动规格。
+  ///
+  /// 与 `codex exec` 不同，这里直接启动官方交互式 `codex`：登录、插件、
+  /// Skills、MCP、审批、会话恢复全部交给 Codex 自身处理。宿主项目目录
+  /// bind 到 guest `/workspace`，TUI 的 cwd 固定为 `/workspace`，因此
+  /// Codex 看到的就是用户当前项目。
+  ///
+  /// 返回 null 表示 Linux Runtime 或 Codex CLI 尚未就绪，调用方应显示
+  /// 明确错误，而不是静默回退成普通 Shell。
+  Future<LinuxProcessSpec?> buildCodexTuiSpec({
+    required String hostWorkspaceDir,
+    String guestWorkingDirectory = '/workspace',
+  }) async {
+    return _buildCodexSpec(
+      hostWorkspaceDir: hostWorkspaceDir,
+      guestWorkingDirectory: guestWorkingDirectory,
+      codexArguments: const [],
+      label: 'codex-tui',
+    );
+  }
+
+  /// 构建长驻 Codex app-server 启动规格。
+  ///
+  /// 这是 App 内 AI 聊天的「完整 Codex」入口：由同一个 app-server 进程
+  /// 承载多轮会话，线程、插件、Skills、MCP、动态工具和续聊状态全部由
+  /// Codex 本体维护，不再每轮 `codex exec` 冷启动。
+  ///
+  /// 注意：仅关闭插件发现预取（Android PRoot 下额外 worker 线程会触发
+  /// `OS can't spawn worker thread`），插件功能本身保持开启。
+  Future<LinuxProcessSpec?> buildCodexAppServerSpec({
+    required String hostWorkspaceDir,
+    String guestWorkingDirectory = '/workspace',
+  }) async {
+    return _buildCodexSpec(
+      hostWorkspaceDir: hostWorkspaceDir,
+      guestWorkingDirectory: guestWorkingDirectory,
+      codexArguments: const [
+        'app-server',
+        '--listen',
+        'stdio://',
+        '-c',
+        'features.plugins=true',
+        '-c',
+        'features.plugin_discovery_prefetch=false',
+      ],
+      label: 'codex-app-server',
+    );
+  }
+
+  Future<LinuxProcessSpec?> _buildCodexSpec({
+    required String hostWorkspaceDir,
+    required String guestWorkingDirectory,
+    required List<String> codexArguments,
+    required String label,
+  }) async {
+    final paths = await resolvePaths();
+    final codexExecutable = await resolveExecutable('codex');
+    if (codexExecutable == null) return null;
+
+    // host 的项目根始终挂到 guest /workspace；Codex cwd 可以是其子目录
+    // （例如 /workspace/git/repo）。不能把 host 根直接挂到 cwd，否则
+    // Codex 看到的“项目目录”实际仍是 App 根目录，项目文件和 git 状态
+    // 都会错位。
+    const guestWorkspaceRoot = '/workspace';
+    final bindTarget = '${paths.rootfsDir}$guestWorkspaceRoot';
+    try {
+      await Directory(bindTarget).create(recursive: true);
+    } catch (e) {
+      LogService.warning('LinuxRuntime', '创建 Codex 工作区 bind 目标失败: $e');
+      return null;
+    }
+
+    final codexGuestPath = _toRootfsPath(paths.rootfsDir, codexExecutable);
+    final extraEnvironment = <String, String>{};
+    final apiKey = _readDeepSeekKey(paths);
+    if (apiKey != null) {
+      extraEnvironment['DEEPSEEK_API_KEY'] = apiKey;
+    }
+
+    return _buildProotSpec(
+      paths,
+      innerCommand: [
+        '/bin/bash',
+        '-lc',
+        'exec ${_shellQuote(codexGuestPath)}'
+            '${codexArguments.map((arg) => ' ${_shellQuote(arg)}').join()}',
+      ],
+      workingDirectory: guestWorkingDirectory,
+      extraBinds: ['$hostWorkspaceDir:$guestWorkspaceRoot'],
+      extraEnvironment: extraEnvironment,
+      label: label,
+    );
+  }
+
   /// 统一生成 PRoot 参数（禁止在调用点重复拼接）
   LinuxProcessSpec _buildProotSpec(
     LinuxRuntimePaths paths, {
@@ -566,11 +660,17 @@ class LinuxRuntimeProvider implements IRuntimeProvider {
     String? workingDirectory,
     Duration? timeout,
     required String label,
+    List<String> extraBinds = const [],
+    Map<String, String> extraEnvironment = const {},
   }) {
     final arguments = <String>[
       '-r',
       paths.rootfsDir,
       ...prootBindArguments(),
+      for (final bind in extraBinds) ...[
+        '-b',
+        bind,
+      ],
       if (workingDirectory != null) ...[
         '-w',
         workingDirectory,
@@ -581,11 +681,38 @@ class LinuxRuntimeProvider implements IRuntimeProvider {
     return LinuxProcessSpec(
       executable: paths.prootExecutable,
       arguments: arguments,
-      environment: buildEnvironment(paths),
+      environment: {...buildEnvironment(paths), ...extraEnvironment},
       workingDirectory: workingDirectory,
       timeout: timeout,
       label: label,
     );
+  }
+
+  /// rootfs 绝对路径 → PRoot guest 路径。
+  static String _toRootfsPath(String rootfsDir, String executable) {
+    if (!executable.startsWith(rootfsDir)) return executable;
+    final relative = executable.substring(rootfsDir.length);
+    if (relative.isEmpty) return executable;
+    return relative.startsWith('/') ? relative : '/$relative';
+  }
+
+  /// POSIX shell 单引号转义（路径可能包含空格或特殊字符）。
+  static String _shellQuote(String value) =>
+      "'${value.replaceAll("'", "'\\''")}'";
+
+  /// 读取 rootfs 内已保存的 DeepSeek API key。
+  static String? _readDeepSeekKey(LinuxRuntimePaths paths) {
+    try {
+      final envFile = File('${paths.rootfsDir}/root/.mimo2codex/.env');
+      if (!envFile.existsSync()) return null;
+      for (final line in envFile.readAsLinesSync()) {
+        if (line.startsWith('DS_API_KEY=')) {
+          final key = line.substring('DS_API_KEY='.length).trim();
+          if (key.isNotEmpty) return key;
+        }
+      }
+    } catch (_) {}
+    return null;
   }
 
   // ─── 内部 ────────────────────────────────────────────────────

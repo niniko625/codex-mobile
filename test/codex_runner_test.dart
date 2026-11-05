@@ -884,7 +884,7 @@ void main() {
       expect(content, contains('base_url = "https://api.deepseek.com"'));
       expect(content, contains('env_key = "DEEPSEEK_API_KEY"'));
       expect(content, contains('[features]'));
-      expect(content, contains('plugins = false'));
+      expect(content, contains('plugins = true'));
       // 幂等标记只出现一次
       expect('[model_providers.deepseek]'.allMatches(content), hasLength(1));
     });
@@ -911,7 +911,7 @@ void main() {
           lessThan(content.indexOf('[projects."/workspace"]')));
     });
 
-    test('已有 provider 块但缺 plugins → 只补写插件关闭项并保留原内容', () async {
+    test('已有 provider 块但缺 plugins → 只补写插件启用项并保留原内容', () async {
       const original = 'model = "deepseek-flash"\n'
           '[model_providers.deepseek]\n'
           'base_url = "https://api.deepseek.com"\n';
@@ -925,11 +925,11 @@ void main() {
       final updated = configFile().readAsStringSync();
       expect(updated, startsWith(original.trimRight()));
       expect(updated, contains('[features]'));
-      expect(updated, contains('plugins = false'));
+      expect(updated, contains('plugins = true'));
       expect('[model_providers.deepseek]'.allMatches(updated), hasLength(1));
     });
 
-    test('已有 [features] 表 → 原地补 plugins=false，不生成重复 table', () async {
+    test('已有 [features] 表 → 原地补 plugins=true，不生成重复 table', () async {
       const original = 'model = "deepseek-flash"\n'
           '[model_providers.deepseek]\n'
           'base_url = "https://api.deepseek.com"\n\n'
@@ -944,7 +944,7 @@ void main() {
       expect(result.isSuccess, isTrue);
       final updated = configFile().readAsStringSync();
       expect(updated, contains('other_feature = true'));
-      expect(updated, contains('plugins = false'));
+      expect(updated, contains('plugins = true'));
       expect('[features]'.allMatches(updated), hasLength(1));
     });
 

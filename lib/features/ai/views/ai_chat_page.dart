@@ -88,6 +88,17 @@ class _AiChatPageState extends ConsumerState<AiChatPage> {
     _scrollToBottom();
   }
 
+  void _openCodexTui() {
+    final workspace = ref.read(chatProvider).workspaceDir;
+    final uri = Uri(
+      path: RouteNames.codex,
+      queryParameters: (workspace == null || workspace.isEmpty)
+          ? null
+          : {'workspace': workspace},
+    );
+    context.push(uri.toString());
+  }
+
   Future<void> _showSessionHistory() async {
     await showModalBottomSheet<void>(
       context: context,
@@ -246,6 +257,11 @@ class _AiChatPageState extends ConsumerState<AiChatPage> {
         centerTitle: false,
         backgroundColor: colorScheme.surfaceContainer,
         actions: [
+          IconButton(
+            icon: const Icon(Icons.terminal_rounded),
+            tooltip: '完整 Codex（官方 TUI）',
+            onPressed: _openCodexTui,
+          ),
           IconButton(
             icon: const Icon(Icons.tune_rounded),
             tooltip: '部署中心',

@@ -841,7 +841,7 @@ void main() {
       // 顶层 model_catalog_json 指向 rootfs 内 models.json（消除 fallback 警告）
       expect(content, contains('model_catalog_json = "/root/.codex/models.json"'));
       expect(content, contains('[features]'));
-      expect(content, contains('plugins = false'));
+      expect(content, contains('plugins = true'));
       final models =
           File('${f.temp.path}/rootfs/root/.codex/models.json');
       expect(models.existsSync(), isTrue, reason: 'models.json 必须部署');
@@ -873,11 +873,11 @@ void main() {
       f.adapter.installedVersions['/usr/bin/codex'] = '0.9.0';
       final config = File('${f.temp.path}/rootfs/root/.codex/config.toml');
       config.createSync(recursive: true);
-      // 已含 DeepSeek 直连 + model_catalog_json + 插件关闭 → 幂等
+      // 已含 DeepSeek 直连 + model_catalog_json + 插件启用 → 幂等
       config.writeAsStringSync('model = "custom-model"\n'
           'model_catalog_json = "/root/.codex/models.json"\n'
           '[model_providers.deepseek]\nname = "Keep"\n\n'
-          '[features]\nplugins = false\n');
+          '[features]\nplugins = true\n');
 
       final installer = _codexInstaller(
         loadShellAdditions: () async => '# Codex Mobile Pro\n',
@@ -888,7 +888,7 @@ void main() {
       expect(config.readAsStringSync(), 'model = "custom-model"\n'
           'model_catalog_json = "/root/.codex/models.json"\n'
           '[model_providers.deepseek]\nname = "Keep"\n\n'
-          '[features]\nplugins = false\n',
+          '[features]\nplugins = true\n',
           reason: '已完整配置时应保持用户自定义内容原样不覆盖');
     });
 
@@ -912,7 +912,7 @@ void main() {
       final upgraded = config.readAsStringSync();
       expect(upgraded, startsWith(original.trimRight()));
       expect(upgraded, contains('[features]'));
-      expect(upgraded, contains('plugins = false'));
+      expect(upgraded, contains('plugins = true'));
       expect('[features]'.allMatches(upgraded), hasLength(1));
     });
 
@@ -943,7 +943,7 @@ void main() {
       expect(upgraded, contains('custom-model'), reason: '用户内容不被覆盖');
       expect(upgraded, contains('name = "Keep"'), reason: '用户内容不被覆盖');
       expect(upgraded, contains('[features]'));
-      expect(upgraded, contains('plugins = false'));
+      expect(upgraded, contains('plugins = true'));
     });
 
     test('Codex CLI 安装成功 → 部署 DeepSeek 模型元数据到 /root/.codex/models.json',

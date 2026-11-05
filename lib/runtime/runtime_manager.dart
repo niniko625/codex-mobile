@@ -453,6 +453,26 @@ class RuntimeManager {
     }
   }
 
+  /// 构建完整 Codex TUI 启动规格（PTY 直接启动官方交互式 codex）。
+  ///
+  /// 工作区 bind 由 LinuxRuntimeProvider 统一生成；未就绪返回 null。
+  Future<LinuxProcessSpec?> buildCodexTuiSpec({
+    required String hostWorkspaceDir,
+  }) async {
+    final linux = linuxProvider;
+    if (linux == null) return null;
+    try {
+      final paths = await linux.resolvePaths();
+      final ready = File(paths.prootExecutable).existsSync() &&
+          (File('${paths.rootfsDir}/usr/bin/bash').existsSync() ||
+              File('${paths.rootfsDir}/bin/bash').existsSync());
+      if (!ready) return null;
+      return await linux.buildCodexTuiSpec(hostWorkspaceDir: hostWorkspaceDir);
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// 检查工具是否已安装
   Future<bool> isInstalled(RuntimeTool tool) async {
     return await _environment?.isToolInstalled(tool) ?? false;

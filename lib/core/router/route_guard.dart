@@ -122,6 +122,7 @@ class RoutePermissions {
       case RouteNames.localeSettings:
       case RouteNames.workspaceList:
       case RouteNames.terminal:
+      case RouteNames.codex:
       case RouteNames.repoList:
       case RouteNames.gitHubLogin:
         return PermissionLevel.public;

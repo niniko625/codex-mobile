@@ -119,14 +119,14 @@ env_key = "DEEPSEEK_API_KEY"
 wire_api = "responses"
 
 [features]
-plugins = false
+plugins = true
 ''';
 
   /// config.toml 已配置的幂等标记
   static const String codexConfigMarker = '[model_providers.deepseek]';
 
-  /// Codex 插件系统关闭标记（Android 上插件同步线程可能 OOM/线程耗尽）。
-  static const String pluginsDisabledMarker = 'plugins = false';
+  /// Codex 插件系统启用标记。
+  static const String pluginsEnabledMarker = 'plugins = true';
 
   /// 模型元数据目录在 rootfs 内的绝对路径（与 [codexConfigToml] 中
   /// model_catalog_json 保持一致；codex 在 HOME=/root 下读取）。
@@ -461,9 +461,9 @@ plugins = false
   /// DEEPSEEK_API_KEY（由 bashrc-additions.sh 从 ~/.mimo2codex/.env
   /// export），直连 DeepSeek、跳过登录。
   ///
-  /// 幂等：provider 与 `features.plugins=false` 均已配置 → 跳过。
+  /// 幂等：provider 与 `features.plugins=true` 均已配置 → 跳过。
   /// 两个配置独立自愈：旧版本 config 已有 DeepSeek provider 时，仍会补写
-  /// 插件关闭项，避免 codex 0.147 在 Android 上启动插件同步线程后 panic。
+  /// 插件启用项，保证官方插件 / Skills / MCP 能力可用。
   /// 失败不阻断安装。
   Future<void> _writeCodexConfig(
       ToolchainContext ctx, List<String> warnings) async {
@@ -483,15 +483,15 @@ plugins = false
             updated = '$modelCatalogLine\n$updated';
             actions.add('补写 model_catalog_json');
           }
-          final withPluginsDisabled = _withPluginsDisabled(updated);
-          if (withPluginsDisabled != updated) {
-            updated = withPluginsDisabled;
-            actions.add('补写 features.plugins=false');
+          final withPluginsEnabled = _withPluginsEnabled(updated);
+          if (withPluginsEnabled != updated) {
+            updated = withPluginsEnabled;
+            actions.add('启用 features.plugins=true');
           }
 
           if (actions.isEmpty) {
             report(ctx, InstallPhase.completed, 1.0,
-                'Codex 已配置 DeepSeek 直连 + 模型目录 + 插件关闭');
+                'Codex 已配置 DeepSeek 直连 + 模型目录 + 插件启用');
           } else {
             await config.writeAsString(updated);
             report(ctx, InstallPhase.completed, 1.0,
@@ -509,8 +509,8 @@ plugins = false
     }
   }
 
-  /// 幂等关闭 Codex 插件系统，兼容已有 `[features]` 表与用户其他配置。
-  static String _withPluginsDisabled(String content) {
+  /// 幂等启用 Codex 插件系统，兼容已有 `[features]` 表与用户其他配置。
+  static String _withPluginsEnabled(String content) {
     final headerRe = RegExp(
       r'^[ \t]*\[features\][ \t]*(?:#.*)?$',
       multiLine: true,
@@ -518,7 +518,7 @@ plugins = false
     final header = headerRe.firstMatch(content);
     if (header == null) {
       final tail = content.trimRight();
-      return '${tail.isEmpty ? '' : '$tail\n\n'}[features]\nplugins = false\n';
+      return '${tail.isEmpty ? '' : '$tail\n\n'}[features]\nplugins = true\n';
     }
 
     final afterHeader = content.substring(header.end);
@@ -535,17 +535,17 @@ plugins = false
       multiLine: true,
     ).firstMatch(section);
     if (pluginKey != null) {
-      if (pluginKey.group(2)!.trim() == 'false') return content;
+      if (pluginKey.group(2)!.trim() == 'true') return content;
       final start = header.end + pluginKey.start;
       final end = header.end + pluginKey.end;
       return content.replaceRange(
         start,
         end,
-        '${pluginKey.group(1)}false${pluginKey.group(3)}',
+        '${pluginKey.group(1)}true${pluginKey.group(3)}',
       );
     }
 
-    return content.replaceRange(header.end, header.end, '\nplugins = false');
+    return content.replaceRange(header.end, header.end, '\nplugins = true');
   }
 }
 

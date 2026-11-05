@@ -17,6 +17,7 @@ import '../../features/settings/views/log_center_page.dart';
 import '../../features/settings/views/theme_settings_page.dart';
 import '../../features/settings/views/update_settings_page.dart';
 import '../../features/terminal/views/terminal_page.dart';
+import '../../features/terminal/services/terminal_service.dart';
 import '../../features/workspace/views/workspace_list_page.dart';
 import '../navigation/global_navigator_key.dart';
 import 'route_guard.dart';
@@ -95,6 +96,19 @@ final appRouterProvider = Provider<GoRouter>((ref) {
         path: RouteNames.terminal,
         name: 'terminal',
         builder: (context, state) => const TerminalPage(),
+      ),
+      GoRoute(
+        path: RouteNames.codex,
+        name: 'codex',
+        builder: (context, state) {
+          final workspace = state.uri.queryParameters['workspace'];
+          return TerminalPage(
+            launchMode: TerminalLaunchMode.codexTui,
+            workspaceDir: (workspace == null || workspace.isEmpty)
+                ? null
+                : workspace,
+          );
+        },
       ),
       // ── 编辑器 ──
       GoRoute(

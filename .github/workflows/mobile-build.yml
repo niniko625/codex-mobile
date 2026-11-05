@@ -103,6 +103,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          STATUS_FILE="$RUNNER_TEMP/ci-results/overall.status"
+          if [ ! -f "$STATUS_FILE" ] || [ "$(cat "$STATUS_FILE")" != "0" ]; then
+            echo 'CI 未全部通过，跳过 Release 发布'
+            exit 0
+          fi
           APK=build/app/outputs/flutter-apk/app-release.apk
           if [ ! -f "$APK" ]; then
             echo '本次没有生成 APK，跳过 Release 发布'
@@ -142,3 +147,16 @@ jobs:
           git push --force \
             "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
             "HEAD:refs/heads/${ARTIFACT_BRANCH}"
+
+      - name: Enforce CI result
+        if: always()
+        shell: bash
+        run: |
+          STATUS_FILE="$RUNNER_TEMP/ci-results/overall.status"
+          if [ ! -f "$STATUS_FILE" ]; then
+            echo '缺少 CI 结果文件，判定失败'
+            exit 1
+          fi
+          OVERALL="$(cat "$STATUS_FILE")"
+          echo "CI overall status: $OVERALL"
+          exit "$OVERALL"

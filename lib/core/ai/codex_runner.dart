@@ -90,7 +90,15 @@ class CodexCommandCompleted extends CodexEvent {
 class CodexTurnCompleted extends CodexEvent {
   final int? inputTokens;
   final int? outputTokens;
-  const CodexTurnCompleted({this.inputTokens, this.outputTokens});
+  final String status;
+
+  const CodexTurnCompleted({
+    this.inputTokens,
+    this.outputTokens,
+    this.status = 'completed',
+  });
+
+  bool get interrupted => status == 'interrupted';
 }
 
 /// codex 事件错误（多为无害 fallback 警告，如 model metadata）
@@ -218,18 +226,19 @@ base_url = "https://api.deepseek.com"
 env_key = "DEEPSEEK_API_KEY"
 wire_api = "responses"
 
-# Android 线程/内存有限；codex 0.147 默认的 curated plugin 同步线程会在
-# 资源不足时 panic（OS can't spawn worker thread），导致 turn.started 后
-# 永远没有 agent_message。聊天命令同时用 -c 覆盖，旧配置也能立即生效。
+# config 默认启用插件，供「完整 Codex」官方 TUI 使用（插件/Skills/MCP）。
+# App 内聊天走 codex exec，命令行会额外 -c features.plugins=false：
+# codex exec 在 Android 上启用插件同步线程会因线程耗尽 panic，表现为
+# turn.started 后一直 working 无输出。两条路径互不影响。
 [features]
-plugins = false
+plugins = true
 ''';
 
   /// config.toml 已配置的幂等标记（与 npm_toolchain_installers.dart 一致）
   static const String codexConfigMarker = '[model_providers.deepseek]';
 
-  /// Codex 插件系统关闭标记。
-  static const String pluginsDisabledMarker = 'plugins = false';
+  /// Codex 插件系统启用标记。
+  static const String pluginsEnabledMarker = 'plugins = true';
 
   /// Android 宿主绝对路径特征（在 Ubuntu rootfs 内不存在 → codex 读取必 ENOENT）
   static final RegExp _hostPathPattern =
@@ -610,6 +619,10 @@ plugins = false
   }) {
     final resuming = threadId != null && threadId.isNotEmpty;
     final sessionArg = resuming ? ' ${_shellQuote(threadId)}' : '';
+    // codex exec 在 Android 上启用插件同步线程会 panic（OS can't spawn
+    // worker thread）→ turn.started 后永远没有 agent_message，聊天卡在
+    // working。这里只对 App 内非交互聊天关闭插件；官方 TUI 启动时仍读取
+    // config.toml 的 plugins = true，完整能力不受影响。
     return 'exec $codexBin -c features.plugins=false '
         'exec ${resuming ? 'resume ' : ''}'
         '--json --skip-git-repo-check '
@@ -862,7 +875,8 @@ plugins = false
   ///      DeepSeek 块；若原内容已含顶层 `model`/`model_provider` 键，只补
   ///      provider table（避免 TOML 重复顶层键报错）。
   ///   4. 首次运行前部署的旧 config 可能已有 provider、没有 `[features]`
-  ///      → 独立补写 `plugins = false`，关闭 Android 上会 panic 的插件同步。
+  ///      → 独立补写 `plugins = true`，让官方 TUI 获得插件/Skills/MCP；
+  ///      App 内 codex exec 聊天由命令行覆盖关闭插件线程（见 _buildCodexCommand）。
   ///
   /// 任何失败 → LogService.warning 并返回描述，绝不阻断对话。
   static String _ensureCodexConfig(String rootfsDir) {
@@ -889,10 +903,10 @@ plugins = false
           actions.add('已补写 provider 块（保留原 ${tail.split('\n').length} 行内容）');
         }
 
-        final withPluginsDisabled = _withPluginsDisabled(updated);
-        if (withPluginsDisabled != updated) {
-          updated = withPluginsDisabled;
-          actions.add('已补写 features.plugins=false');
+        final withPluginsEnabled = _withPluginsEnabled(updated);
+        if (withPluginsEnabled != updated) {
+          updated = withPluginsEnabled;
+          actions.add('已启用 features.plugins=true');
         }
         if (actions.isEmpty) {
           return 'provider 与 features.plugins 均已配置，跳过（幂等）';
@@ -917,12 +931,12 @@ plugins = false
     return codexConfigToml.substring(idx).trimLeft();
   }
 
-  /// 幂等关闭 Codex 插件系统，兼容已有 `[features]` 表与用户其他配置。
+  /// 幂等启用 Codex 插件系统，兼容已有 `[features]` 表与用户其他配置。
   ///
   /// 不能简单追加 `[features]`：若原文件已有该表会生成重复 table，TOML
   /// 解析失败。这里优先替换表中已有的 `plugins` 键，其次插入到表头之后，
   /// 最后才新建该表。
-  static String _withPluginsDisabled(String content) {
+  static String _withPluginsEnabled(String content) {
     final headerRe = RegExp(
       r'^[ \t]*\[features\][ \t]*(?:#.*)?$',
       multiLine: true,
@@ -930,7 +944,7 @@ plugins = false
     final header = headerRe.firstMatch(content);
     if (header == null) {
       final tail = content.trimRight();
-      return '${tail.isEmpty ? '' : '$tail\n\n'}[features]\nplugins = false\n';
+      return '${tail.isEmpty ? '' : '$tail\n\n'}[features]\nplugins = true\n';
     }
 
     final afterHeader = content.substring(header.end);
@@ -947,17 +961,17 @@ plugins = false
       multiLine: true,
     ).firstMatch(section);
     if (pluginKey != null) {
-      if (pluginKey.group(2)!.trim() == 'false') return content;
+      if (pluginKey.group(2)!.trim() == 'true') return content;
       final start = header.end + pluginKey.start;
       final end = header.end + pluginKey.end;
       return content.replaceRange(
         start,
         end,
-        '${pluginKey.group(1)}false${pluginKey.group(3)}',
+        '${pluginKey.group(1)}true${pluginKey.group(3)}',
       );
     }
 
-    return content.replaceRange(header.end, header.end, '\nplugins = false');
+    return content.replaceRange(header.end, header.end, '\nplugins = true');
   }
 
   /// 读取 rootfs 内 DeepSeek API key（DS_API_KEY=）

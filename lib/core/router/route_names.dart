@@ -18,6 +18,7 @@ abstract class RouteNames {
 
   // ── 终端 ──
   static const terminal = '/terminal';
+  static const codex = '/codex';
 
   // ── 编辑器 ──
   static const editor = '/editor';

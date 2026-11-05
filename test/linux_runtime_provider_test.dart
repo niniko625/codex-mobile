@@ -221,6 +221,80 @@ void main() {
         '-l',
       ]);
     });
+
+    test('buildCodexTuiSpec → 官方交互式 TUI + 工作区 bind + 自动建 bind 目标',
+        () async {
+      final paths = createFakePaths(tmp);
+      File('${paths.rootfsDir}/usr/local/bin/codex')
+        ..createSync(recursive: true)
+        ..writeAsStringSync('#!/bin/sh\n');
+      final provider = LinuxRuntimeProvider(paths: paths);
+      final workspace = Directory('${tmp.path}/host-project')
+        ..createSync(recursive: true);
+
+      final spec = await provider.buildCodexTuiSpec(
+        hostWorkspaceDir: workspace.path,
+      );
+
+      expect(spec, isNotNull);
+      expect(spec!.executable, paths.prootExecutable);
+      expect(spec.arguments, contains('${workspace.path}:/workspace'));
+      expect(spec.arguments, contains('-w'));
+      expect(spec.arguments[spec.arguments.indexOf('-w') + 1], '/workspace');
+      expect(
+        spec.arguments[spec.arguments.indexOf('-lc') + 1],
+        "exec '/usr/local/bin/codex'",
+      );
+      // 首次部署 rootfs 没有 /workspace，必须先建 bind 目标
+      expect(Directory('${paths.rootfsDir}/workspace').existsSync(), isTrue);
+      // TUI 必须拿到真实终端类型
+      expect(spec.environment['TERM'], 'xterm-256color');
+    });
+
+    test('buildCodexAppServerSpec → 完整 Codex app-server + 工作区 bind 到 /workspace',
+        () async {
+      final paths = createFakePaths(tmp);
+      File('${paths.rootfsDir}/usr/local/bin/codex')
+        ..createSync(recursive: true)
+        ..writeAsStringSync('#!/bin/sh\n');
+      final provider = LinuxRuntimeProvider(paths: paths);
+      final workspace = Directory('${tmp.path}/host-project')
+        ..createSync(recursive: true);
+
+      final spec = await provider.buildCodexAppServerSpec(
+        hostWorkspaceDir: workspace.path,
+        guestWorkingDirectory: '/workspace/git/repo',
+      );
+
+      expect(spec, isNotNull);
+      expect(spec!.executable, paths.prootExecutable);
+      // host 项目根永远挂到 guest /workspace，cwd 只能是它的子目录
+      expect(spec.arguments, contains('${workspace.path}:/workspace'));
+      expect(
+        spec.arguments,
+        isNot(contains('${workspace.path}:/workspace/git/repo')),
+      );
+      expect(
+        spec.arguments[spec.arguments.indexOf('-w') + 1],
+        '/workspace/git/repo',
+      );
+      final inner = spec.arguments[spec.arguments.indexOf('-lc') + 1];
+      expect(inner, contains('app-server'));
+      expect(inner, contains('features.plugins=true'));
+      expect(inner, contains('features.plugin_discovery_prefetch=false'));
+      expect(Directory('${paths.rootfsDir}/workspace').existsSync(), isTrue);
+    });
+
+    test('buildCodexTuiSpec → codex 未安装返回 null', () async {
+      final paths = createFakePaths(tmp);
+      final provider = LinuxRuntimeProvider(paths: paths);
+
+      final spec = await provider.buildCodexTuiSpec(
+        hostWorkspaceDir: tmp.path,
+      );
+
+      expect(spec, isNull);
+    });
   });
 
   group('LinuxRuntimeProvider — capabilities', () {

@@ -141,10 +141,17 @@ class HomePage extends ConsumerWidget {
             ),
             children: [
               _ToolTile(
+                icon: Icons.terminal_rounded,
+                title: '完整 Codex',
+                subtitle: '官方 TUI · 插件 · Skills',
+                color: colorScheme.primary,
+                onTap: () => context.push(RouteNames.codex),
+              ),
+              _ToolTile(
                 icon: Icons.auto_awesome_rounded,
                 title: 'Codex 对话',
                 subtitle: '描述任务并执行',
-                color: colorScheme.primary,
+                color: colorScheme.onSurfaceVariant,
                 onTap: () => context.push(RouteNames.aiChat),
               ),
               _ToolTile(

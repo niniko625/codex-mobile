@@ -11,9 +11,20 @@ import '../../../core/terminal/native_pty_backend.dart';
 import '../../../core/terminal/process_terminal_backend.dart';
 import '../../../runtime/process/guest_cwd.dart';
 import '../../../runtime/runtime_manager.dart';
+import '../../../core/ai/workspace_dir_resolver.dart';
 import 'ring_buffer.dart';
 
 // ─── Shell 信息（本地定义，替代旧 ShellDetector）─────────────
+
+/// 终端启动前置条件不满足（Runtime / Codex 未安装等）。
+class TerminalLaunchException implements Exception {
+  const TerminalLaunchException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
 
 
 /// Shell 信息
@@ -102,6 +113,15 @@ Map<String, String> _buildTerminalEnvironment({
 /// 终端会话状态
 enum TerminalSessionStatus { running, exited, error }
 
+/// 终端启动模式
+enum TerminalLaunchMode {
+  /// 普通交互式 Shell（PRoot → bash / Android sh）
+  shell,
+
+  /// 完整 Codex：PTY 直接启动官方交互式 TUI（非 codex exec）
+  codexTui,
+}
+
 // ─── 终端输出行 ───────────────────────────────────────────────
 
 /// 终端输出行
@@ -126,6 +146,7 @@ class TerminalSession {
   final String id;
   String name;
   final ShellInfo shellInfo;
+  final TerminalLaunchMode launchMode;
   String cwd;
   TerminalSessionStatus status;
 
@@ -133,6 +154,12 @@ class TerminalSession {
   int rows;
   int cols;
   final RingBuffer<TerminalLine> outputBuffer;
+
+  /// 启动环境覆盖项（例如 Codex 的 DEEPSEEK_API_KEY）。
+  ///
+  /// 合并顺序：基础环境 → RuntimeManager Linux 环境 → 本覆盖项，
+  /// 保证调用方可以精确覆盖单个变量而不重写整套环境。
+  final Map<String, String> environmentOverrides;
   Process? _process;
   StreamSubscription? _stdoutSub;
   StreamSubscription? _stderrSub;
@@ -156,16 +183,26 @@ class TerminalSession {
   /// 正常交互下 prompt/重绘序列远小于该值，不会触发）。
   static const int maxPendingLength = 65536;
 
+  /// 全屏 TUI 的原始流尾部上限（字符）。
+  ///
+  /// TUI 依赖绝对光标定位和 alternate screen，必须保留原始 ANSI 顺序；
+  /// 按行缓冲后再 join('\n') 会改变转义流语义。保留最近 96KB，足够
+  /// 覆盖多帧全屏重绘，同时避免每次按键都重解析整段历史。
+  static const int maxTuiTailChars = 96 * 1024;
+  String _tuiTail = '';
+
   TerminalSession({
     required this.id,
     required this.name,
     required this.shellInfo,
     required this.cwd,
+    this.launchMode = TerminalLaunchMode.shell,
     this.status = TerminalSessionStatus.running,
     this.rows = 60,
     this.cols = 120,
     RingBuffer<TerminalLine>? outputBuffer,
     ITerminalBackend? backend,
+    this.environmentOverrides = const {},
   }) : outputBuffer = outputBuffer ?? RingBuffer<TerminalLine>(maxBufferSize),
        _backend = backend;
 
@@ -176,6 +213,7 @@ class TerminalSession {
 
   /// 获取当前输出文本
   String get outputText {
+    if (launchMode == TerminalLaunchMode.codexTui) return _tuiTail;
     final lines = outputBuffer.toList().map((l) => l.text).toList();
     if (_streamMode && _pendingLine.isNotEmpty) {
       lines.add(_pendingLine);
@@ -195,6 +233,15 @@ class TerminalSession {
   /// 逐行模式（Process 后端，LineSplitter 已按行切好）：保持原行为。
   void addOutput(String text, {bool isStderr = false}) {
     if (_disposed) return;
+    if (launchMode == TerminalLaunchMode.codexTui) {
+      // 原样保留 ANSI 流（含 \r、光标定位、alternate screen），
+      // 只裁剪最旧部分；渲染器需要完整顺序才能还原 TUI 画面。
+      _tuiTail += text;
+      if (_tuiTail.length > maxTuiTailChars) {
+        _tuiTail = _tuiTail.substring(_tuiTail.length - maxTuiTailChars);
+      }
+      return;
+    }
     if (!_streamMode) {
       final lines = text.split('\n');
       for (final line in lines) {
@@ -235,6 +282,13 @@ class TerminalSession {
     }
   }
 
+  /// 清空输出（保留会话与后端进程）。
+  void clearOutput() {
+    outputBuffer.clear();
+    _pendingLine = '';
+    _tuiTail = '';
+  }
+
   /// 启动进程
   Future<bool> start() async {
     if (_process != null || _nativeSession != null) return true;
@@ -271,6 +325,17 @@ class TerminalSession {
 
   /// 使用 Process.start() 启动（回退方案）
   Future<bool> _startWithProcess() async {
+    // 官方 Codex TUI 是 raw-mode 全屏程序，必须有 PTY；Process 管道会
+    // 让 codex 判定 stdin 非终端，要么直接退出，要么无法接收按键。
+    if (launchMode == TerminalLaunchMode.codexTui) {
+      status = TerminalSessionStatus.error;
+      addOutput(
+        '完整 Codex 需要 PTY 会话，当前设备 Native PTY 未启用，无法启动。',
+        isStderr: true,
+      );
+      return false;
+    }
+
     final appDir = await getApplicationDocumentsDirectory();
 
     // 从 RuntimeManager 获取运行环境（Linux 优先）
@@ -279,7 +344,10 @@ class TerminalSession {
       runtimeEnv = await RuntimeManager.instance.getTerminalEnvironment();
     } catch (_) {}
 
-    final env = _buildTerminalEnvironment(home: appDir.path, runtimeEnv: runtimeEnv);
+    final env = {
+      ..._buildTerminalEnvironment(home: appDir.path, runtimeEnv: runtimeEnv),
+      ...environmentOverrides,
+    };
 
     LogService.info('Terminal', '  使用 Process 回退');
     LogService.info('Terminal', '  HOME: ${env['HOME']}');
@@ -336,7 +404,10 @@ class TerminalSession {
       runtimeEnv = await RuntimeManager.instance.getTerminalEnvironment();
     } catch (_) {}
 
-    final env = _buildTerminalEnvironment(home: appDir.path, runtimeEnv: runtimeEnv);
+    final env = {
+      ..._buildTerminalEnvironment(home: appDir.path, runtimeEnv: runtimeEnv),
+      ...environmentOverrides,
+    };
 
     try {
       _nativeSession = await _backend!.createSession(
@@ -372,6 +443,12 @@ class TerminalSession {
       return true;
     } catch (e) {
       LogService.error('Terminal', '  Native PTY 启动失败: $e，回退到 Process 后端');
+      // TUI 不能退回 Process 管道后端（非 TTY），直接暴露真实错误。
+      if (launchMode == TerminalLaunchMode.codexTui) {
+        status = TerminalSessionStatus.error;
+        addOutput('完整 Codex 启动失败: $e', isStderr: true);
+        return false;
+      }
       // 回退到 Process 启动
       _backend = null;
       return await _startWithProcess();
@@ -557,6 +634,7 @@ class TerminalService {
   Future<TerminalSession> createSession({
     String? name,
     String? cwd,
+    TerminalLaunchMode launchMode = TerminalLaunchMode.shell,
   }) async {
     // 确保后端已初始化
     await initDefaultBackend();
@@ -565,6 +643,10 @@ class TerminalService {
     // 使用 App 私有目录作为默认工作目录
     final appDir = await getApplicationDocumentsDirectory();
     final home = cwd ?? appDir.path;
+
+    if (launchMode == TerminalLaunchMode.codexTui) {
+      return _createCodexTuiSession(name: name, requestedWorkspace: home);
+    }
 
     // guest cwd（PRoot rootfs 内）：host 路径不得直接作为 guest 工作目录，
     // 否则 proot 会报 can't chdir(...) in the guest rootfs 并回落到 "/"。
@@ -592,6 +674,68 @@ class TerminalService {
     final started = await session.start();
     if (!started) {
       LogService.warning('Terminal', '会话 ${session.id} 启动失败');
+    }
+    return session;
+  }
+
+  /// 创建完整 Codex TUI 会话。
+  ///
+  /// 这里不经过 `codex exec`：PRoot 内直接执行交互式 `codex`，由官方 TUI
+  /// 负责登录、插件、Skills、MCP、审批与会话恢复。宿主工作目录 bind 到
+  /// guest `/workspace`，所以 Codex 看到的是真实项目目录。
+  Future<TerminalSession> _createCodexTuiSession({
+    required String? name,
+    required String requestedWorkspace,
+  }) async {
+    if (_backend is! NativePtyBackend) {
+      throw const TerminalLaunchException(
+        '完整 Codex 需要 Native PTY 后端（全屏 TUI 依赖真实终端）。'
+        '当前设备未启用 PTY，请重新安装 APK 后重试。',
+      );
+    }
+
+    final resolved = resolveCodexWorkspaceDir(requestedWorkspace);
+    var hostWorkspaceDir = resolved.path;
+    if (hostWorkspaceDir.isEmpty) hostWorkspaceDir = requestedWorkspace;
+    try {
+      await Directory(hostWorkspaceDir).create(recursive: true);
+    } catch (e) {
+      throw TerminalLaunchException('无法访问工作区 $hostWorkspaceDir: $e');
+    }
+
+    final spec = await RuntimeManager.instance.buildCodexTuiSpec(
+      hostWorkspaceDir: hostWorkspaceDir,
+    );
+    if (spec == null) {
+      throw const TerminalLaunchException(
+        '完整 Codex 暂不可用：请先在部署中心完成 Linux Runtime 与 Codex CLI 安装',
+      );
+    }
+
+    final shellInfo = ShellInfo(
+      shellPath: spec.executable,
+      args: spec.arguments,
+      version: 'Codex TUI',
+      isLinux: true,
+    );
+    final session = TerminalSession(
+      id: const Uuid().v4(),
+      name: name ?? 'Codex',
+      shellInfo: shellInfo,
+      cwd: hostWorkspaceDir,
+      launchMode: TerminalLaunchMode.codexTui,
+      backend: _backend,
+      environmentOverrides: spec.environment,
+    );
+
+    _sessions.add(session);
+    LogService.info('Terminal', '创建完整 Codex 会话: ${session.id}');
+    LogService.info('Terminal', '  工作区(host): $hostWorkspaceDir → guest /workspace');
+    LogService.info('Terminal', '  PRoot: ${spec.executable} ${spec.arguments.join(' ')}');
+
+    final started = await session.start();
+    if (!started) {
+      LogService.warning('Terminal', '完整 Codex 会话 ${session.id} 启动失败');
     }
     return session;
   }

@@ -31,7 +31,17 @@ import '../widgets/terminal_output.dart';
 /// Shell prompt 由实际 Shell（PRoot → bash 或 /system/bin/sh）提供，
 /// UI 层不伪造提示符。
 class TerminalPage extends ConsumerStatefulWidget {
-  const TerminalPage({super.key});
+  const TerminalPage({
+    super.key,
+    this.launchMode = TerminalLaunchMode.shell,
+    this.workspaceDir,
+  });
+
+  /// 启动模式：普通 Shell 或完整 Codex TUI。
+  final TerminalLaunchMode launchMode;
+
+  /// 完整 Codex 的初始工作区（host 路径；null = App 文档目录）。
+  final String? workspaceDir;
 
   @override
   ConsumerState<TerminalPage> createState() => _TerminalPageState();
@@ -50,6 +60,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
   Timer? _refreshTimer;
   bool _autoScroll = true;
   bool _settingsVisible = false;
+  String? _startupError;
 
   /// Shell 当前输入行中已经实时写入的文本。
   ///
@@ -73,8 +84,14 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
     // 会话生命周期由全局 TerminalProvider 持有，离开页面再进入不丢失。
     Future.microtask(() async {
       if (!mounted) return;
-      if (ref.read(terminalProvider).sessions.isEmpty) {
-        await ref.read(terminalProvider.notifier).createSession();
+      final sessions = ref.read(terminalProvider).sessions;
+      final existing = sessions.where(
+        (session) => session.launchMode == widget.launchMode,
+      );
+      if (existing.isEmpty) {
+        await _createSession();
+      } else if (widget.launchMode == TerminalLaunchMode.codexTui) {
+        ref.read(terminalProvider.notifier).switchSession(existing.last.id);
       }
       _requestKeyboardSoon();
     });
@@ -261,6 +278,22 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
     );
   }
 
+  Future<void> _createSession() async {
+    try {
+      await ref.read(terminalProvider.notifier).createSession(
+            cwd: widget.workspaceDir,
+            launchMode: widget.launchMode,
+          );
+      if (!mounted) return;
+      setState(() => _startupError = null);
+    } catch (e) {
+      if (!mounted) return;
+      final message = e.toString();
+      setState(() => _startupError = message);
+      LogService.error('Terminal', '创建会话失败: $message');
+    }
+  }
+
   /// 历史命令回填：同步替换 Shell 当前输入行，避免旧字符残留。
   void _applyHistoryCommand(String? command) {
     final next = command ?? '';
@@ -309,7 +342,11 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
       appBar: AppBar(
         backgroundColor: kTerminalDark,
         foregroundColor: kTerminalText,
-        title: Text(s.terminalTitle),
+        title: Text(
+          widget.launchMode == TerminalLaunchMode.codexTui
+              ? 'Codex'
+              : s.terminalTitle,
+        ),
         centerTitle: false,
         actions: [
           // 1. 设置
@@ -328,7 +365,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
             icon: const Icon(Icons.add, color: kTerminalText),
             tooltip: s.terminalNew,
             onPressed: () async {
-              await ref.read(terminalProvider.notifier).createSession();
+              await _createSession();
               _requestKeyboardSoon();
             },
           ),
@@ -402,6 +439,17 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
 
           // ── 多会话 Tab 栏 ──
           if (state.sessions.length > 1) _buildTabBar(state),
+
+          if (_startupError != null)
+            Container(
+              width: double.infinity,
+              color: Colors.red.shade900,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              child: Text(
+                _startupError!,
+                style: const TextStyle(color: Colors.white, fontSize: 12),
+              ),
+            ),
 
           // ── 终端输出（纯黑背景，ANSI 渲染，Expanded 占满剩余空间） ──
           Expanded(
